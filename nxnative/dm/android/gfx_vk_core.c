@@ -368,7 +368,13 @@ static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t
         VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, p->buf, &req);
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size,
             vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
-        VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &p->mem)); VKCHK(vkBindBufferMemory(V.dev, p->buf, p->mem, 0));
+        { VkResult ar = vkAllocateMemory(V.dev, &ai, NULL, &p->mem);
+          if (ar) { unsigned long long z = 0, cp = 0; int nz = 0, nc = 0; for (int i = 0; i < g_npool; i++) { uint64_t s = g_pool[i].hi - g_pool[i].lo; if (g_pool[i].view) continue; if (g_pool[i].zero_copy) { z += s; nz++; } else { cp += s; nc++; } }
+              FILE *st = fopen("/proc/self/status", "r"); char ln[256], rss[64] = "?"; while (st && fgets(ln, sizeof ln, st)) if (!strncmp(ln, "VmRSS:", 6)) { snprintf(rss, sizeof rss, "%s", ln + 6); rss[strcspn(rss, "\n")] = 0; } if (st) fclose(st);
+              int nmap = 0; FILE *mf = fopen("/proc/self/maps", "r"); if (mf) { int ch; while ((ch = fgetc(mf)) != EOF) nmap += ch == '\n'; fclose(mf); }
+              VKLOG("[RED] copied pool %p +%#llx (base %#llx end %#llx, reason %d, mem type %u): vkAllocateMemory %d; pools now: %d zero-copy %.1f MB, %d copied %.1f MB; RSS%s; %d mappings",
+                    mem, (unsigned long long)size, (unsigned long long)base, (unsigned long long)end, zc, ai.memoryTypeIndex, ar, nz, z / 1048576.0, nc, cp / 1048576.0, rss, nmap); }
+          VKCHK(ar); } VKCHK(vkBindBufferMemory(V.dev, p->buf, p->mem, 0));
         void *m; VKCHK(vkMapMemory(V.dev, p->mem, 0, VK_WHOLE_SIZE, 0, &m)); p->shadow = m;
     }
     g_npool++; pool_ord_make(); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
