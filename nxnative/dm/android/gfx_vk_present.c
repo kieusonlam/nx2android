@@ -840,6 +840,13 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         VKLOG("replay per frame (last 600): %.0f draws, replay %.2f ms (descriptor sets %.2f, pipeline keys %.2f), queue submit %.2f ms, uniform shadows %.0f KB; GPU busy %.2f ms; texture uploads %.1f (%.2f MB, %.2f ms); descriptor sets reused %llu, new %llu (collecting %.2f ms, hashing %.2f, new ones %.2f), kept per stage %.0f a frame (memo differences %llu)",
               nd, (g_vkst.ns_exec - pe) / 6e8, (g_vkst.ns_desc - pd) / 6e8, (g_vkst.ns_pipe - pp) / 6e8, (g_ns_submit - ps) / 6e8, (g_ubd_bytes - pb) / 600.0 / 1024, (g_gpu_ns - pg) / 6e8, (g_pkg_n - pkn) / 600.0, (g_pkg_bytes - pkb) / 600.0 / 1048576, (g_pkg_ns - pkt) / 6e8, (unsigned long long)g_set_hits, (unsigned long long)g_set_new, (g_ns_set_build - psb) / 6e8, (g_ns_set_hash - psh) / 6e8, (g_ns_set_new - psn) / 6e8,
               (g_set_memo - psm) / 600.0, (unsigned long long)g_set_memo_bad);
+        { extern uint64_t g_ns_shadow_wait, g_ns_shadow_sync, g_n_shadow_begin; static uint64_t pw, ps2, pn;
+          VKLOG("copied pools per frame (last 600): %.1f submissions began after waiting for the GPU %.2f ms, then syncing %.2f ms", (g_n_shadow_begin - pn) / 600.0, (g_ns_shadow_wait - pw) / 6e8, (g_ns_shadow_sync - ps2) / 6e8);
+          pw = g_ns_shadow_wait; ps2 = g_ns_shadow_sync; pn = g_n_shadow_begin; }
+        { extern uint64_t g_ubd_fast, g_ubd_slow, g_ns_ubd_slow, g_ubd_infl_sum; static uint64_t pf, pl, pt, pi;
+          VKLOG("uniform reads per frame (last 600): %.0f from one deferred update, %.0f the long way (%.2f ms, %.0f in-flight updates each)", (g_ubd_fast - pf) / 600.0, (g_ubd_slow - pl) / 600.0,
+                (g_ns_ubd_slow - pt) / 6e8, g_ubd_slow > pl ? (double)(g_ubd_infl_sum - pi) / (double)(g_ubd_slow - pl) : 0.0);
+          pf = g_ubd_fast; pl = g_ubd_slow; pt = g_ns_ubd_slow; pi = g_ubd_infl_sum; }
         void vk_pass_report(void); vk_pass_report();
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }

@@ -267,6 +267,27 @@ int vk_pool_remap_ro(void *mem, size_t len) {
     pthread_rwlock_unlock(&g_pool_mu);
     return !rc && done == len ? 0 : -1;
 }
+// Zero-copy pools' pages mapped again at dst, read-write (vm_remap with copy=FALSE on Android, darwin_compat.c: a sparse pool's physical pages): each chunk's dma-buf
+// mapped a second time at its offset. 0 = done; -1 when a part of [src, src+len) is not in a zero-copy pool
+int vk_pool_alias(void *dst, uint64_t src, size_t len) {
+    int rc = 0; uint64_t s = src, e = src + len;
+    pthread_rwlock_rdlock(&g_pool_mu);
+    while (s < e && !rc) {
+        vkpool_t *p = NULL;
+        for (int i = 0; i < g_npool && !p; i++) if (g_pool[i].zero_copy && g_pool[i].lo <= s && s < g_pool[i].hi) p = &g_pool[i];
+        if (!p) { rc = -1; break; }
+        uint64_t n = (p->hi < e ? p->hi : e) - s;
+        int sv[2], fds[16], nfd = -1; if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) { rc = -1; break; }
+        if (!AHardwareBuffer_sendHandleToUnixSocket(p->ahb, sv[0])) nfd = recv_fds(sv[1], fds, 16);
+        close(sv[0]); close(sv[1]);
+        void *at = (uint8_t *)dst + (s - src);
+        rc = nfd >= 1 && mmap(at, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fds[0], (off_t)(s - p->lo)) == at ? 0 : -1;
+        for (int k = 0; k < nfd; k++) close(fds[k]);
+        s += n;
+    }
+    pthread_rwlock_unlock(&g_pool_mu);
+    return rc;
+}
 static void pool_copy_back(vkpool_t *p) {   // the pages go back to anonymous memory with the buffer's contents (the game may reuse the memory)
     uint64_t size = p->hi - p->lo; uint8_t *mem = (uint8_t *)(uintptr_t)p->lo;
     uint8_t *save = malloc(size); if (save) memcpy(save, mem, size);
@@ -277,23 +298,60 @@ static void pool_copy_back(vkpool_t *p) {   // the pages go back to anonymous me
 // (vendor.qti.hardware.display.allocator-service, snapalloc) aborts on a BLOB of 812 MB ("ubsan: mul-overflow" in SnapConstraintManager::AlignmentToAlignedConstraints),
 // and the whole Android UI restarts with it; 400 MB ones work (13 Sentinels: Aegis Rim's 0x32c00000-byte pool). A range across two chunks has no buffer (vk_pool_of)
 #define ZC_CHUNK 0x10000000ull
-static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end);
+static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end, int copy);
 // DM_VK_ZEROCOPY_MAX_MB=<n>: pools bigger than n MB are copied, not zero-copy, and kept whole (a copied pool takes no hardware buffer, so no chunks). The Legion Y700
 // 2023's gralloc aborts the process (no error returned) allocating a hardware buffer for Unicorn Overlord's 860 MB pool, while its pools up to 250 MB are fine
 static int zc_over(uint64_t size) { static uint64_t m = 1; if (m == 1) { const char *e = getenv("DM_VK_ZEROCOPY_MAX_MB"); m = e && atoi(e) > 0 ? (uint64_t)atoi(e) << 20 : 0; } return m && size > m; }
+static uint64_t g_pool_serial;
+const uint8_t *nvn_sparse_phys(uint64_t a) __attribute__((weak));   // hle_nvn.c
+int nvn_sparse_range(uint64_t a, uint64_t *base, uint64_t *len) __attribute__((weak)); uint64_t nvn_sparse_read(void *dst, uint64_t a, uint64_t n) __attribute__((weak));
+void nvn_sparse_phys_protect(uint64_t a, uint64_t n) __attribute__((weak));
+uint64_t nvn_sparse_read_mapped(void *dst, uint64_t a, uint64_t n) __attribute__((weak));
+// A run of a sparse pool's mapped pages (hle_nvn.c vpool_*): it has no storage of its own, its pages alias physical pools' (vm_remap), each a buffer of its own, and
+// Vulkan cannot put several buffers' memory behind one (no sparse binding on the Adreno 650). Registered as views: one entry per stretch backed by one contiguous range
+// of one physical pool's buffer, at its offset there (boff). Made zero-copy like any pool, a run got a hardware buffer of its own over the alias, a copy of the
+// physical pools that the game's later writes no longer reached (Monster Hunter Rise). A binding across two stretches has no buffer, and one bound at a stretch
+// is cut at its end: Monster Hunter Rise's physical pools are 4 MB, given out at falling addresses and mapped in rising order, so no two are contiguous, and
+// its buffers of tens of MB read past the stretch into other memory (a depth pass walking a tree there never ended: GPU hang). Made a copied pool each, a run was
+// made again (copied whole from the CPU's pages) whenever a mapping joined it, and what GPU copies had put in it was lost: the hunter's body and face, uploaded that
+// way, were never drawn. So by default the reservation has GPU copies in fixed chunks instead (sparse_chunk_for), and runs are not registered; DM_VK_SPARSE_VIEWS=1
+// (start-up) registers runs as views as before
+static int sparse_views(void) { static int v = -1; if (v < 0) v = getenv("DM_VK_SPARSE_VIEWS") != NULL; return v; }
+static void pool_add_views(uint64_t a, uint64_t size) {
+    pthread_rwlock_wrlock(&g_pool_mu);
+    int nv = 0; uint64_t miss = 0;
+    for (uint64_t o = 0; o < size; ) {
+        const uint8_t *ph = nvn_sparse_phys(a + o); const vkpool_t *src = NULL;
+        if (ph) for (int i = 0; i < g_npool && !src; i++) if (!g_pool[i].view && g_pool[i].buf && (uint64_t)(uintptr_t)ph >= g_pool[i].lo && (uint64_t)(uintptr_t)ph < g_pool[i].hi) src = &g_pool[i];
+        uint64_t e = o + 0x1000 - ((a + o) & 0xFFF);
+        if (src) while (e < size && nvn_sparse_phys(a + e) == ph + (e - o) && (uint64_t)(uintptr_t)(ph + (e - o)) < src->hi) e += 0x1000;
+        if (e > size) e = size;
+        if (!src) { miss += e - o; o = e; continue; }
+        if (g_npool == MAXPOOL) { pthread_rwlock_unlock(&g_pool_mu); die("[vk] too many memory pools"); }
+        vkpool_t *p = &g_pool[g_npool++]; memset(p, 0, sizeof *p);
+        p->lo = a + o; p->hi = a + e; p->base = a; p->end = a + size; p->serial = ++g_pool_serial;
+        p->buf = src->buf; p->boff = (uint64_t)(uintptr_t)ph - src->lo + src->boff; p->flags = src->flags; p->view = 1;
+        nv++; o = e;
+    }
+    pool_ord_make(); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+    pthread_rwlock_unlock(&g_pool_mu);
+    static int nlog; if (nlog++ < 24 || miss) VKLOG("%ssparse pool run %#llx +%#llx: %d views of physical pools%s%.1f MB not in any pool", miss ? "[RED] " : "", (unsigned long long)a, (unsigned long long)size, nv, miss ? ", " : " (", miss / 1048576.0);
+}
 void mtl_pool_add(const void *mem, uint64_t size) {
     vk_init();
     if (!size) return;
-    uint64_t a = (uint64_t)(uintptr_t)mem, c = ((a | size) & 0xfff) || zc_over(size) ? size : ZC_CHUNK;
-    for (uint64_t o = 0; o < size; o += c) pool_add_one((const uint8_t *)mem + o, size - o < c ? size - o : c, a, a + size);
+    uint64_t a = (uint64_t)(uintptr_t)mem, sb, sl;
+    if (nvn_sparse_range && nvn_sparse_range(a, &sb, &sl)) { if (sparse_views()) pool_add_views(a, size); return; }   // a run of a sparse pool (hle_nvn.c vrun_set, under its lock): see pool_add_views
+    uint64_t c = ((a | size) & 0xfff) || zc_over(size) ? size : ZC_CHUNK;
+    for (uint64_t o = 0; o < size; o += c) pool_add_one((const uint8_t *)mem + o, size - o < c ? size - o : c, a, a + size, 0);
     if (size > c) VKLOG("memory pool %p +%#llx: %llu chunks of at most %#llx", mem, (unsigned long long)size, (unsigned long long)((size + c - 1) / c), c);
 }
-static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end) {
+static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end, int copy) {
     pthread_rwlock_wrlock(&g_pool_mu);
     if (g_npool == MAXPOOL) { pthread_rwlock_unlock(&g_pool_mu); die("[vk] too many memory pools"); }
     vkpool_t *p = &g_pool[g_npool]; memset(p, 0, sizeof *p);
-    p->lo = (uint64_t)(uintptr_t)mem; p->hi = p->lo + size; p->base = base; p->end = end; { static uint64_t ser; p->serial = ++ser; }
-    int zc = ((uintptr_t)mem & 0xfff) || (size & 0xfff) ? -3 : getenv("DM_VK_NO_ZEROCOPY") ? -4 : zc_over(end - base) ? -5 : pool_zero_copy(p, (uint8_t *)mem, size);
+    p->lo = (uint64_t)(uintptr_t)mem; p->hi = p->lo + size; p->base = base; p->end = end; p->serial = ++g_pool_serial;
+    int zc = ((uintptr_t)mem & 0xfff) || (size & 0xfff) ? -3 : getenv("DM_VK_NO_ZEROCOPY") || copy ? -4 : zc_over(end - base) ? -5 : pool_zero_copy(p, (uint8_t *)mem, size);
     if (zc) {
         static int said; if (!said++) VKLOG("[RED] memory pool %p +%#llx could not be zero-copy (%d): a GPU copy is refreshed before each submission (slow)", mem, (unsigned long long)size, zc);
         VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size, POOL_USAGE, VK_SHARING_MODE_EXCLUSIVE};
@@ -310,16 +368,53 @@ static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t
     static int nlog; if (nlog++ < 24) VKLOG("memory pool %p +%#llx: %s (zero-copy %.1f MB, copied %.1f MB)", mem, (unsigned long long)size, zc ? "copied" : "zero-copy", zc_bytes / 1048576.0, cp_bytes / 1048576.0);
 }
 void mtl_pool_del(const void *mem) {
+    { uint64_t sb, sl; if (!sparse_views() && nvn_sparse_range && nvn_sparse_range((uint64_t)(uintptr_t)mem, &sb, &sl)) return; }   // a sparse pool's run: not registered (pool_add_views)
     for (;;) {   // every chunk of the pool
         pthread_rwlock_wrlock(&g_pool_mu);
         int i = 0; while (i < g_npool && g_pool[i].base != (uint64_t)(uintptr_t)mem) i++;
         if (i == g_npool) { pthread_rwlock_unlock(&g_pool_mu); return; }
         vkpool_t p = g_pool[i]; g_pool[i] = g_pool[--g_npool]; pool_ord_make(); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
         pthread_rwlock_unlock(&g_pool_mu);
+        if (p.view) continue;   // the buffer is the physical pool's
         if (p.zero_copy) pool_copy_back(&p);
         vk_defer_free_buffer(p.buf, p.mem);   // the AHardwareBuffer goes with the imported memory's last reference
         if (p.ahb) AHardwareBuffer_release(p.ahb);
     }
+}
+// A sparse pool's reservation (hle_nvn.c) gets GPU copies in fixed chunks (DM_VK_SPARSE_CHUNK_MB, 512 by default: with 256 a storage buffer 8 MB below a chunk's end held a larger
+// tree, and the shader walking it read past its binding and hung the GPU), each made when a binding first needs it and kept until
+// the pool goes (vk_sparse_drop): a copied pool synced through the page table, its CPU range tracked for writes, and the pages a mapping changes stamped as written
+// (hle_nvn.c vpool_touched). What the GPU writes stays in the copy (not copied back: storage buffers here are bound to the chunk's end, an address taken from a uniform
+// buffer has no size). A range across two chunks has no buffer
+static void pool_fill(vkpool_t *p, uint64_t off, uint64_t n);
+static vkpool_t *sparse_chunk_for(uint64_t addr, uint64_t len) {
+    uint64_t b, l; if (sparse_views() || !nvn_sparse_range || !nvn_sparse_read || !nvn_sparse_range(addr, &b, &l)) return NULL;
+    static uint64_t C; if (!C) { const char *e = getenv("DM_VK_SPARSE_CHUNK_MB"); C = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 512) << 20; }
+    uint64_t lo = b + (addr - b) / C * C, hi = lo + C < b + l ? lo + C : b + l;
+    if (addr + len > hi) { static int n; if (n++ < 8) VKLOG("[RED] sparse pool range %#llx +%#llx across two chunks: no buffer", (unsigned long long)addr, (unsigned long long)len); return NULL; }
+    pthread_rwlock_rdlock(&g_pool_mu); int have = 0; for (int i = 0; i < g_npool; i++) have |= g_pool[i].sparse_run && g_pool[i].lo == lo; pthread_rwlock_unlock(&g_pool_mu);
+    if (!have) {
+        pool_add_one((const void *)(uintptr_t)lo, hi - lo, lo, hi, 1);
+        nvn_dirty_add_range((const void *)(uintptr_t)lo, hi - lo);
+        pthread_rwlock_wrlock(&g_pool_mu);
+        for (int i = 0; i < g_npool; i++) { vkpool_t *p = &g_pool[i]; if (p->base != lo || !p->shadow || p->sparse_run) continue;
+            p->flags |= 0x2; p->sparse_run = 1; p->span = nvn_dirty_span((const void *)(uintptr_t)lo, hi - lo);
+            uint64_t st = nvn_dirty_now(); if (p->span) nvn_dirty_protect((const void *)(uintptr_t)lo, hi - lo);
+            if (nvn_sparse_phys_protect) nvn_sparse_phys_protect(lo, hi - lo);   // (writes through the physical pools: nvn_sparse_phys_written)
+            void *sn = mmap(NULL, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); p->snap = sn == MAP_FAILED ? NULL : sn;
+            if (p->snap && nvn_sparse_read_mapped) { nvn_sparse_read_mapped(p->snap, lo, hi - lo); memcpy(p->shadow, p->snap, hi - lo); } else pool_fill(p, 0, hi - lo);
+            p->synced = 1; p->stamp0 = p->stamp = st; }   // filled now: this submission's draws read it before the next sync
+        pthread_rwlock_unlock(&g_pool_mu);
+        static int n; if (n++ < 16) VKLOG("sparse pool chunk %#llx +%#llx: a GPU copy made", (unsigned long long)lo, (unsigned long long)(hi - lo));
+    }
+    return vk_pool_of(addr, len);
+}
+void vk_sparse_drop(uint64_t base, uint64_t len) {   // hle_nvn.c vpool_release: the pool goes
+    pthread_rwlock_wrlock(&g_pool_mu);
+    for (int i = 0; i < g_npool;) { vkpool_t p = g_pool[i]; if (!p.sparse_run || p.lo < base || p.lo >= base + len) { i++; continue; }
+        g_pool[i] = g_pool[--g_npool]; nvn_dirty_remove_range((const void *)(uintptr_t)p.lo); vk_defer_free_buffer(p.buf, p.mem); if (p.snap) munmap(p.snap, p.hi - p.lo); }
+    pool_ord_make(); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+    pthread_rwlock_unlock(&g_pool_mu);
 }
 vkpool_t *vk_pool_of(uint64_t addr, uint64_t len) {
     // the last pools this thread found, while none was added or removed: the replay looks up every buffer binding of every draw, and the read lock alone was ~6% of it
@@ -336,6 +431,7 @@ vkpool_t *vk_pool_of(uint64_t addr, uint64_t len) {
                                            else if (addr >= g_pool[i].lo && addr < g_pool[i].hi && addr + len <= g_pool[i].end) across = 1;
     pthread_rwlock_unlock(&g_pool_mu);
     if (r) { if (c.gen != g) { memset(&c, 0, sizeof c); c.gen = g; } memmove(&c.p[1], &c.p[0], 3 * sizeof *c.p); c.p[0] = r; }
+    if (!r && !across && nvn_sparse_range) { uint64_t sb, sl; if (nvn_sparse_range(addr, &sb, &sl)) return sparse_chunk_for(addr, len); }
     if (!r && across) { static uint64_t n; uint64_t k = ++n; if (!(k & (k - 1))) LOG("[RED] [vk] %llu ranges across two chunks of a memory pool (ZC_CHUNK; this one %#llx +%#llx): no buffer for them", (unsigned long long)k, (unsigned long long)addr, (unsigned long long)len); }
     return r;
 }
@@ -343,7 +439,7 @@ uint32_t vk_pool_gen(void) { return __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIR
 int vk_buf_at(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     vkpool_t *p = vk_pool_of(addr, len ? len : 1);
     if (!p) return 0;
-    *buf = p->buf; *off = addr - p->lo; return 1;
+    *buf = p->buf; *off = addr - p->lo + p->boff; return 1;
 }
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     vkpool_t *p = vk_pool_of(addr, len ? len : 1);
@@ -362,6 +458,39 @@ static uint64_t g_sync_bytes, g_sync_full;   // copied pools: bytes copied by th
 // Copied pools: the guest's bytes into the GPU copy. The first sync copies the whole pool; later ones copy only the 64 KB blocks with pages the CPU wrote since the last
 // sync (nvn_dirty's write-protect tracking: a block is protected again before it is copied, so a write during the copy is caught by the next sync). An 860 MB
 // pool copied whole at every submission (Unicorn Overlord on a Legion Y700 2023) ran at a few frames a second
+// A copied pool's bytes into its GPU copy: a sparse pool's chunk reads its pages through the page table (unmapped ones as 0; their CPU pages may be inaccessible)
+static void pool_fill(vkpool_t *p, uint64_t off, uint64_t n) {
+    if (p->sparse_run && nvn_sparse_read) nvn_sparse_read(p->shadow + off, p->lo + off, n); else memcpy(p->shadow + off, (const uint8_t *)(uintptr_t)p->lo + off, n);
+}
+// A sparse chunk takes only the bytes the CPU changed since they were last synced (against snap, its CPU bytes then), of the pages written since stamp0: the GPU writes
+// into the same pages as the CPU (skinned vertices among the data the CPU writes), and a page or 64 KB block copied whole put the CPU's old bytes over what the GPU wrote
+// (the hunter in the character maker drew as a black silhouette). snap is an anonymous mapping filled only where pages are mapped: memory only for those
+static uint64_t g_sync_diff;
+static void snap_diff(vkpool_t *p, uint64_t off, const uint8_t *now, uint64_t n) {
+    uint8_t *sn = p->snap + off, *sh = p->shadow + off;
+    for (uint64_t i = 0; i < n; i += 256) { uint64_t m = n - i < 256 ? n - i : 256;
+        if (!memcmp(sn + i, now + i, m)) continue;
+        for (uint64_t j = i; j < i + m; j += 8) { size_t w = i + m - j < 8 ? i + m - j : 8; if (!memcmp(sn + j, now + j, w)) continue;
+            memcpy(sh + j, now + j, w); memcpy(sn + j, now + j, w); g_sync_diff += w; } }
+}
+static void pages_take(vkpool_t *p, uint64_t off, uint64_t n) {
+    uint8_t *lo = (uint8_t *)(uintptr_t)p->lo; uint64_t run = 0, rn = 0; static __thread uint8_t *buf;
+    for (uint64_t o = off; o <= off + n; o += 4096) {
+        int d = o < off + n && nvn_dirty_since_span(p->span, lo + o, 4096, p->stamp0);
+        if (d) { if (!rn) run = o; rn += 4096; continue; }
+        if (!rn) continue;
+        nvn_dirty_protect(lo + run, rn); g_sync_bytes += rn;
+        if (!p->snap || (!buf && !(buf = malloc(64 << 10)))) pool_fill(p, run, rn);
+        else { nvn_sparse_read(buf, p->lo + run, rn); snap_diff(p, run, buf, rn); }   // (rn <= 64 KB: within one block)
+        rn = 0;
+    }
+}
+void nvn_sparse_phys_written(uint64_t a, uint64_t n, uint64_t stamp, void (*fn)(void *ctx, uint64_t off, const uint8_t *phys, uint64_t len), void *ctx) __attribute__((weak));
+static uint64_t g_sync_phys;
+static void phys_into(void *ctx, uint64_t off, const uint8_t *phys, uint64_t len) {   // a sparse chunk (ctx) takes a run of physical pages the CPU wrote
+    vkpool_t *p = ctx; if (off + len > p->hi - p->lo) len = p->hi - p->lo - off;
+    if (p->snap) snap_diff(p, off, phys, len); else memcpy(p->shadow + off, phys, len); g_sync_phys += len;
+}
 void vk_pools_sync(VkCommandBuffer cb) {
     (void)cb;
     enum { BLK = 64 << 10 };
@@ -372,18 +501,21 @@ void vk_pools_sync(VkCommandBuffer cb) {
         if (!p->span && (p->span = nvn_dirty_span(lo, size))) p->synced = 0;   // tracked only now (nvnMemoryPoolInitialize registers the range after the pool): copied whole once more, protected
         if (!p->synced || !p->span) {   // untracked: every sync copies all of it, as before
             if (p->span) nvn_dirty_protect(lo, size);
-            memcpy(p->shadow, lo, size); g_sync_bytes += size; g_sync_full++; p->synced = 1; p->stamp0 = p->stamp = st; continue; }
+            pool_fill(p, 0, size); g_sync_bytes += size; g_sync_full++; p->synced = 1; p->stamp0 = p->stamp = st;
+            continue; }
         // judged against the sync before the last: a write whose fault took its generation before the last sync's stamp but stored it after that sync looked
         // at its block would otherwise never count (its page is writable from then on, and clean by every later stamp). A dirty block is copied twice
         for (uint64_t off = 0; off < size; off += BLK) {
             uint64_t n = size - off < BLK ? size - off : BLK;
             if (!nvn_dirty_since_span(p->span, lo + off, n, p->stamp0)) continue;
-            nvn_dirty_protect(lo + off, n); memcpy(p->shadow + off, lo + off, n); g_sync_bytes += n;
+            if (p->sparse_run) { pages_take(p, off, n); continue; }
+            nvn_dirty_protect(lo + off, n); pool_fill(p, off, n); g_sync_bytes += n;
         }
+        if (p->sparse_run && nvn_sparse_phys_written) nvn_sparse_phys_written(p->lo, size, p->stamp0, phys_into, p);   // and what reached its pages through the physical pools
         p->stamp0 = p->stamp; p->stamp = st;
     }
     pthread_rwlock_unlock(&g_pool_mu);
-    static uint64_t n, last; if (++n % 600 == 0) { VKLOG("copied pools: %.1f MB synced in the last 600 submissions (%.2f MB each), %llu full copies so far", (g_sync_bytes - last) / 1048576.0, (g_sync_bytes - last) / 600.0 / 1048576.0, (unsigned long long)g_sync_full); last = g_sync_bytes; }
+    static uint64_t n, last; if (++n % 600 == 0) { VKLOG("copied pools: %.1f MB synced in the last 600 submissions (%.2f MB each), %llu full copies so far; sparse pools: %.1f MB from physical pages, %.2f MB changed in all", (g_sync_bytes - last) / 1048576.0, (g_sync_bytes - last) / 600.0 / 1048576.0, (unsigned long long)g_sync_full, g_sync_phys / 1048576.0, g_sync_diff / 1048576.0); last = g_sync_bytes; }
 }
 // Copied pools after a submission: what the GPU wrote, back into the guest's pages. A pool never synced yet is left alone (its copy holds nothing of the game's).
 // A CPU-uncached pool (vk_pool_set_flags) takes back only the ranges the submission's GPU writes covered (sub_gpu_wrote):
@@ -423,38 +555,76 @@ enum { GW_SUB = 64 };
 static vksub_t g_slot[NSLOT]; static int g_cur = -1; uint64_t g_cmd_gen;   // g_cmd_gen: main command buffers begun (gfx_vk_exec.c bind cache)
 static void pools_copy_back(const struct vksub *s) {
     pthread_rwlock_rdlock(&g_pool_mu);
+    static int sparse_back = -1; if (sparse_back < 0) { const char *e = getenv("DM_VK_SPARSE_COPYBACK"); sparse_back = e && atoi(e); }
     for (int i = 0; i < g_npool; i++) { vkpool_t *p = &g_pool[i]; if (!p->shadow || !p->synced) continue;
+        // a sparse pool's run: what the GPU wrote stays in the copy (the sync takes only blocks the CPU wrote). Its storage buffers are bound to the run's end (an address
+        // from a uniform buffer has no size), so the ranges written covered tens of MB: copied back after each submission, then synced again as written, about 95 ms a
+        // frame in Monster Hunter Rise. DM_VK_SPARSE_COPYBACK=1 (start-up): copied back by range as other CPU-uncached pools
+        if (p->sparse_run && !sparse_back) continue;
         if (!(p->flags & 0x2)) { memcpy((void *)(uintptr_t)p->lo, p->shadow, p->hi - p->lo); continue; }
         for (int k = 0; k < s->ngw; k++) { uint64_t lo = s->gw[k].lo > p->lo ? s->gw[k].lo : p->lo, hi = s->gw[k].hi < p->hi ? s->gw[k].hi : p->hi;
             if (lo < hi) memcpy((void *)(uintptr_t)lo, p->shadow + (lo - p->lo), hi - lo); } }
     pthread_rwlock_unlock(&g_pool_mu);
 }
 static VkCommandBuffer g_slot_main_cb(void) { return g_slot[g_cur].main; }
-// DM_VK_PASS_TIMES=1: a timestamp before and after every render pass (the replay's per-frame line then lists the passes that cost the most GPU time)
-enum { PASSQ = 128 };   // passes timed per submission
+// DM_VK_PASS_TIMES=1: a timestamp before and after every render pass and every compute dispatch (the replay's per-frame lines then list the passes and shaders that
+// cost the most GPU time, and the time between them: barriers, end marks, copies, fills). Both at the bottom of the pipe: the span starts once the work before is done
+enum { PASSQ = 512 };   // passes and dispatches timed per submission
 static VkQueryPool g_pq; static int g_pq_on = -1;
-typedef struct { uint32_t w, h, fmt, draws, fidx; } pass_meta;   // fidx: the pass's place in its frame (submissions are cut every DM_VK_CB_DRAWS draws)
-enum { FPASSQ = 512 }; static int g_fpass;   // passes of the frame so far
-void vk_pass_frame(void) { g_fpass = 0; }   // a present: the next pass is the frame's first
+// fidx: the pass's place in its frame (submissions are cut every DM_VK_CB_DRAWS draws); kind 0 a pass (key: its fragment shader with the most draws, nps: its fragment shaders), 1 a dispatch (w, h, fmt: its groups)
+typedef struct { uint32_t w, h, fmt, draws, fidx, kind, nps, top; uint64_t key; } pass_meta;
+enum { FPASSQ = 1024 }; static int g_fpass;   // passes and dispatches of the frame so far
+static uint32_t g_pframes;   // presents since the last report
+void vk_pass_frame(void) { g_fpass = 0; g_pframes++; }   // a present: the next pass is the frame's first
 static pass_meta g_pmeta[NSLOT][PASSQ]; static int g_npass[NSLOT];
 static double g_pacc[FPASSQ]; static uint32_t g_pcnt[FPASSQ]; static pass_meta g_plast[FPASSQ]; static int g_pmax;   // by the pass's place in its frame (the completion thread adds)
+static double g_pgap, g_pkind[2]; static uint32_t g_pnkind[2];   // time between timed spans, and in spans of each kind, since the last report
+enum { PKEYS = 1024 }; static struct { uint64_t key; uint32_t kind, n, nps; double ms; } g_pkey[PKEYS];   // by shader (a pass by its fragment shader with the most draws)
+static struct { uint64_t key; uint32_t n; } g_pps[16]; static int g_npps;   // the open pass's fragment shaders and their draws
 static int pass_times_on(void) { if (g_pq_on < 0) { const char *e = getenv("DM_VK_PASS_TIMES"); g_pq_on = e && atoi(e); } return g_pq_on && g_pq; }
-void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws) {
-    if (!pass_times_on() || g_cur < 0) return; int *n = &g_npass[g_cur]; if (*n >= PASSQ) return;
-    vkCmdWriteTimestamp(g_slot_main_cb(), end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_pq, (uint32_t)(g_cur * PASSQ * 2 + *n * 2 + end));
-    if (end) { g_pmeta[g_cur][*n] = (pass_meta){w, h, fmt, draws, (uint32_t)(g_fpass < FPASSQ - 1 ? g_fpass : FPASSQ - 1)}; (*n)++; g_fpass++; }
-}
-void vk_pass_report(void) {   // the most expensive passes since the last report, then the counters start again
+void vk_pass_note_ps(uint64_t key) {   // a draw of the open pass with this fragment shader
     if (!pass_times_on()) return;
+    for (int i = 0; i < g_npps; i++) if (g_pps[i].key == key) { g_pps[i].n++; return; }
+    if (g_npps < 16) g_pps[g_npps++] = (typeof(g_pps[0])){key, 1};
+}
+static void ts_event(int end, pass_meta m) {
+    if (!pass_times_on() || g_cur < 0) return; int *n = &g_npass[g_cur]; if (*n >= PASSQ) return;
+    vkCmdWriteTimestamp(g_slot_main_cb(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_pq, (uint32_t)(g_cur * PASSQ * 2 + *n * 2 + end));
+    if (end) { m.fidx = (uint32_t)(g_fpass < FPASSQ - 1 ? g_fpass : FPASSQ - 1); g_pmeta[g_cur][*n] = m; (*n)++; g_fpass++; }
+}
+void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws) {
+    pass_meta m = {w, h, fmt, draws};
+    if (end) { int b = -1; for (int i = 0; i < g_npps; i++) if (b < 0 || g_pps[i].n > g_pps[b].n) b = i; if (b >= 0) { m.key = g_pps[b].key; m.top = g_pps[b].n; } m.nps = (uint32_t)g_npps; }
+    g_npps = 0; ts_event(end, m);
+}
+void vk_disp_ts(int end, uint64_t key, uint32_t x, uint32_t y, uint32_t z) { ts_event(end, (pass_meta){x, y, z, 0, 0, 1, 0, 0, key}); }
+static void pass_add(const pass_meta *m, double ms) {   // the completion thread: one timed span
+    int f = (int)m->fidx; g_pacc[f] += ms; g_pcnt[f]++; g_plast[f] = *m; if (f + 1 > g_pmax) g_pmax = f + 1;
+    g_pkind[m->kind & 1] += ms; g_pnkind[m->kind & 1]++;
+    uint32_t h = (uint32_t)((m->key ^ m->kind) * 0x9e3779b97f4a7c15ull >> 54) % PKEYS;
+    for (int p = 0; p < PKEYS; p++, h = (h + 1) % PKEYS) {
+        if (g_pkey[h].n && (g_pkey[h].key != m->key || g_pkey[h].kind != m->kind)) continue;
+        if (!g_pkey[h].n) { g_pkey[h].key = m->key; g_pkey[h].kind = m->kind; g_pkey[h].nps = 0; g_pkey[h].ms = 0; }
+        g_pkey[h].n++; g_pkey[h].ms += ms; if (m->nps > g_pkey[h].nps) g_pkey[h].nps = m->nps; return; }
+}
+void vk_pass_report(void) {   // the most expensive passes and shaders since the last report, then the counters start again
+    if (!pass_times_on()) return;
+    double fr = g_pframes ? g_pframes : 1;
     static int idx[FPASSQ]; int m = g_pmax; for (int i = 0; i < m; i++) idx[i] = i;
     for (int i = 0; i < m; i++) for (int j = i + 1; j < m; j++) if (g_pcnt[idx[j]] && (!g_pcnt[idx[i]] || g_pacc[idx[j]] / g_pcnt[idx[j]] > g_pacc[idx[i]] / g_pcnt[idx[i]])) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
-    double tot = 0; for (int i = 0; i < m; i++) if (g_pcnt[i]) tot += g_pacc[i] / g_pcnt[i];
-    char b[1200]; int o = snprintf(b, sizeof b, "passes by GPU time (%d passes, %.2f ms in passes per frame):", m, tot);
-    for (int i = 0; i < m && i < 10 && o < (int)sizeof b - 80; i++) { int k = idx[i]; if (!g_pcnt[k]) continue;
-        o += snprintf(b + o, sizeof b - (size_t)o, " #%d %.2f ms (%ux%u fmt %u, %u draws over %u px wide);", k, g_pacc[k] / g_pcnt[k], g_plast[k].w, g_plast[k].h, g_plast[k].fmt, g_plast[k].draws & 0xffff, g_plast[k].draws >> 16); }
+    char b[2400]; int o = snprintf(b, sizeof b, "GPU time per frame (%u frames): passes %.2f ms (%.0f), dispatches %.2f ms (%.0f), between them %.2f ms; most expensive:", g_pframes,
+                                   g_pkind[0] / fr, g_pnkind[0] / fr, g_pkind[1] / fr, g_pnkind[1] / fr, g_pgap / fr);
+    for (int i = 0; i < m && i < 16 && o < (int)sizeof b - 160; i++) { int k = idx[i]; if (!g_pcnt[k]) continue; const pass_meta *q = &g_plast[k];
+        if (q->kind) o += snprintf(b + o, sizeof b - (size_t)o, " #%d %.2f ms dispatch %016llx %ux%ux%u;", k, g_pacc[k] / g_pcnt[k], (unsigned long long)q->key, q->w, q->h, q->fmt);
+        else o += snprintf(b + o, sizeof b - (size_t)o, " #%d %.2f ms (%ux%u fmt %u, %u draws over %u px wide, %u fragment shaders, most %016llx x%u);", k, g_pacc[k] / g_pcnt[k], q->w, q->h, q->fmt, q->draws & 0xffff, q->draws >> 16, q->nps, (unsigned long long)q->key, q->top); }
     { extern uint64_t g_nvn_discards[2]; static uint64_t pd0, pd1; o += snprintf(b + o, sizeof b - (size_t)o, " discards since: colour %llu, depth %llu", (unsigned long long)(g_nvn_discards[0] - pd0), (unsigned long long)(g_nvn_discards[1] - pd1)); pd0 = g_nvn_discards[0]; pd1 = g_nvn_discards[1]; }
     VKLOG("%s", b);
-    memset(g_pacc, 0, sizeof g_pacc); memset(g_pcnt, 0, sizeof g_pcnt); g_pmax = 0;
+    o = snprintf(b, sizeof b, "GPU time per frame by shader (a pass by its fragment shader with the most draws):");
+    for (int t = 0; t < 24 && o < (int)sizeof b - 120; t++) { int best = -1; for (int i = 0; i < PKEYS; i++) if (g_pkey[i].n && (best < 0 || g_pkey[i].ms > g_pkey[best].ms)) best = i; if (best < 0) break;
+        o += snprintf(b + o, sizeof b - (size_t)o, " %s %016llx %.2f ms (%.1f x%s)", g_pkey[best].kind ? "cs" : "ps", (unsigned long long)g_pkey[best].key, g_pkey[best].ms / fr, g_pkey[best].n / fr, g_pkey[best].kind || g_pkey[best].nps < 2 ? "" : ", passes of several");
+        g_pkey[best].n = 0; }
+    VKLOG("%s", b);
+    memset(g_pacc, 0, sizeof g_pacc); memset(g_pcnt, 0, sizeof g_pcnt); g_pmax = 0; memset(g_pkey, 0, sizeof g_pkey); g_pgap = 0; g_pkind[0] = g_pkind[1] = 0; g_pnkind[0] = g_pnkind[1] = 0; g_pframes = 0;
 }
 // one submission at a time: the game's (hle_nvn.c holds its own lock around them) and the backend's own (texel readback, present)
 static pthread_mutex_t g_sub_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -661,6 +831,20 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l) {
 static void post(post_op o) { vksub_t *s = cur(); if (s->npost == s->cappost) { s->cappost = s->cappost ? 2 * s->cappost : 64; s->post = realloc(s->post, s->cappost * sizeof *s->post); } s->post[s->npost++] = o; }
 void mtl_init(void) { vk_init(); }
 static int g_shadow_pools;
+// Whether the sync must wait for the last submission (its GPU work and the completion thread's copy-back) before it writes into the copies. Not for sparse pool chunks
+// alone: a chunk takes only the bytes the CPU changed since its last sync (snap_diff), and a game changes bytes the GPU reads only once its own fences, which are this
+// backend's, say the GPU is done with them; written while earlier submissions run, the chunk holds what the console's GPU would read from shared memory by then.
+// Monster Hunter Rise's replay waited about 50 ms a frame here for the frame before to finish (replay and GPU took turns: 100 ms a frame docked in Kamura village).
+// Still waited for: a pool copied back after submissions (not a sparse chunk, or DM_VK_SPARSE_COPYBACK=1), one copied whole (not yet synced, or untracked), DM_VK_SYNC_IDLE=1
+static int pools_sync_needs_idle(void) {
+    static int idle = -1, back = -1; if (idle < 0) { const char *e = getenv("DM_VK_SYNC_IDLE"); idle = e && atoi(e); e = getenv("DM_VK_SPARSE_COPYBACK"); back = e && atoi(e); }
+    if (idle || back) return 1;
+    int need = 0; pthread_rwlock_rdlock(&g_pool_mu);
+    for (int i = 0; i < g_npool && !need; i++) { const vkpool_t *p = &g_pool[i]; if (p->shadow) need = !p->sparse_run || !p->snap || !p->synced || !p->span; }
+    pthread_rwlock_unlock(&g_pool_mu); return need;
+}
+uint64_t g_ns_shadow_wait, g_ns_shadow_sync, g_n_shadow_begin;   // copied pools: waiting for the GPU before a submission, then syncing them (the replay's per-frame line)
+static uint64_t tick_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 void mtl_sub_begin(void) {
     vk_init();
     pthread_mutex_lock(&g_sub_lock);
@@ -676,7 +860,7 @@ void mtl_sub_begin(void) {
     // parts early; synced at the commit, those parts read the copy as the last submission left it), and only once no earlier submission still reads it
     pthread_rwlock_rdlock(&g_pool_mu); int shadow = 0; for (int i = 0; i < g_npool; i++) shadow |= g_pool[i].shadow != NULL; pthread_rwlock_unlock(&g_pool_mu);
     g_shadow_pools = shadow;
-    if (shadow) { mtl_wait(g_fence, ~0ull); vk_pools_sync(NULL); }   // (after the completion thread's copy-back of the last submission, not only its GPU work)
+    if (shadow) { uint64_t t0 = tick_ns(); if (pools_sync_needs_idle()) mtl_wait(g_fence, ~0ull); uint64_t t1 = tick_ns(); vk_pools_sync(NULL); g_ns_shadow_wait += t1 - t0; g_ns_shadow_sync += tick_ns() - t1; g_n_shadow_begin++; }   // (after the completion thread's copy-back of the last submission, not only its GPU work)
     if (g_tsq) { vkCmdResetQueryPool(s->main, g_tsq, 2 * (uint32_t)g_cur, 2); vkCmdWriteTimestamp(s->main, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_tsq, 2 * (uint32_t)g_cur); }
     if (g_cq) vkCmdResetQueryPool(s->main, g_cq, (uint32_t)g_cur * CQ, CQ);
     s->ncq = 0;
@@ -807,7 +991,16 @@ int vk_gpu_pending(uint64_t a, uint64_t n) {
     return 0;
 }
 // what a GPU read of [a, a + n) sees at this point of the command stream, into dst (memory, then the deferred updates in order)
+uint64_t g_ubd_fast, g_ubd_slow, g_ns_ubd_slow, g_ubd_infl_sum;
 void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst) {
+    // The newest deferred update overlapping the range, when it covers all of it, decides every byte: one copy. Monster Hunter Rise updates a draw's
+    // constant buffer right before the draw, and the long way read guest memory and then went through every in-flight update (thousands: replay no longer
+    // waits for the GPU) copying the overlapping ones from scratch memory, which is uncached for the CPU — about 10 ms of a 42 ms replay.
+    static int fast = -1; if (fast < 0) { const char *e = getenv("DM_VK_UBD_FAST"); fast = !(e && !atoi(e)); }
+    if (fast) for (int i = g_nubd - 1; i >= 0; i--) if (g_ubd[i].lo < a + n && a < g_ubd[i].hi) {
+        if (g_ubd[i].lo <= a && a + n <= g_ubd[i].hi) { memcpy(dst, g_ubd[i].p + (a - g_ubd[i].lo), n); g_ubd_fast++; return; }
+        break; }
+    uint64_t t0 = tick_ns(); g_ubd_slow++; g_ubd_infl_sum += (uint64_t)g_ninfl;
     if (vk_gpu_pending(a, n)) { static int k; g_ubd_racy++; if (k < 20) { k++; int cov = 0; for (int i = 0; i < g_nubd; i++) if (g_ubd[i].lo <= a && a + n <= g_ubd[i].hi) cov = 1;
         VKLOG("[RED] a CPU read of %#llx +%llu (%s) overlaps a GPU write not known to be complete", (unsigned long long)a, (unsigned long long)n, cov ? "covered by a deferred update" : "partly from memory"); } }
     memcpy(dst, (const void *)(uintptr_t)a, n);
@@ -816,6 +1009,7 @@ void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst) {
             if (lo < hi) memcpy(dst + (lo - a), g_infl[i].data + (lo - g_infl[i].lo), hi - lo); } }
     for (int i = 0; i < g_nubd; i++) { uint64_t lo = g_ubd[i].lo > a ? g_ubd[i].lo : a, hi = g_ubd[i].hi < a + n ? g_ubd[i].hi : a + n;
         if (lo < hi) memcpy(dst + (lo - a), g_ubd[i].p + (lo - g_ubd[i].lo), hi - lo); }
+    g_ns_ubd_slow += tick_ns() - t0;
 }
 // a uniform binding [a, a + n) that deferred updates overlap: its shadow (0 when none overlaps). Shadows are kept per (address, size) until the next update.
 int vk_ubd_shadow(uint64_t a, uint64_t n, VkBuffer *buf, VkDeviceSize *off) {
@@ -858,7 +1052,8 @@ static void *completion_main(void *a) {
         if (g_pq && pass_times_on() && c->slot >= 0) {   // this submission's passes
             int np = c->npass; uint64_t t[PASSQ * 2];
             if (np && vkGetQueryPoolResults(V.dev, g_pq, (uint32_t)(c->slot * PASSQ * 2), (uint32_t)np * 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
-                for (int i = 0; i < np; i++) if (t[2 * i + 1] > t[2 * i]) { int f = (int)c->pmeta[i].fidx; g_pacc[f] += (double)(t[2 * i + 1] - t[2 * i]) * V.props.limits.timestampPeriod / 1e6; g_pcnt[f]++; g_plast[f] = c->pmeta[i]; if (f + 1 > g_pmax) g_pmax = f + 1; }
+                for (int i = 0; i < np; i++) { double tp = V.props.limits.timestampPeriod / 1e6; if (t[2 * i + 1] > t[2 * i]) pass_add(&c->pmeta[i], (double)(t[2 * i + 1] - t[2 * i]) * tp);
+                    if (i && t[2 * i] > t[2 * i - 1]) g_pgap += (double)(t[2 * i] - t[2 * i - 1]) * tp; }
         }
         uint64_t now = gpu_ticks(), tend = 0;
         if (g_tsq && c->slot >= 0) { uint64_t t[2]; if (vkGetQueryPoolResults(V.dev, g_tsq, 2 * (uint32_t)c->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) tend = t[1]; }

@@ -58,7 +58,7 @@ uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryProperty
 void vk_init(void);   // once, from mtl_init or the first use
 
 // ---- memory pools (gfx_vk_core.c): the guest's pool memory is GPU memory (AHardwareBuffer mapped over it) ----
-typedef struct { uint64_t lo, hi; VkBuffer buf; VkDeviceMemory mem; void *ahb; int zero_copy; uint8_t *shadow; uint64_t serial, base, end; int flags, synced; uint64_t stamp, stamp0; const void *span; } vkpool_t;   // serial: unique per pool made (caches of views over a pool's buffer key on it); [base, end): the game's pool, of which [lo, hi) is one chunk (ZC_CHUNK); flags: the NVN pool's (vk_pool_set_flags); synced, stamp, stamp0, span: a copied pool's incremental sync
+typedef struct { uint64_t lo, hi; VkBuffer buf; VkDeviceMemory mem; void *ahb; int zero_copy; uint8_t *shadow; uint64_t serial, base, end; int flags, synced; uint64_t stamp, stamp0; const void *span; uint64_t boff; int view, sparse_run; uint8_t *snap; } vkpool_t;   // boff, view: a view of another pool's buffer (a sparse pool's mapped pages: gfx_vk_core.c pool_add_views), [lo, hi) at boff in buf, which it does not own; sparse_run: a sparse pool's chunk made a copied pool (sparse_chunk_for), snap: its CPU bytes as last synced; serial: unique per pool made (caches of views over a pool's buffer key on it); [base, end): the game's pool, of which [lo, hi) is one chunk (ZC_CHUNK); flags: the NVN pool's (vk_pool_set_flags); synced, stamp, stamp0, span: a copied pool's incremental sync
 vkpool_t *vk_pool_of(uint64_t addr, uint64_t len);   // the pool containing [addr, addr+len), NULL if none
 int vk_buf_at(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);   // GPU buffer + offset of a pool address range
 // Pools that could not be made zero-copy keep a GPU copy refreshed before each submission (vk_pools_sync, called from mtl_sub_commit)
@@ -89,6 +89,9 @@ struct vkimg {
     VkImageLayout layout;           // version 1 keeps every image in GENERAL after its first use
     int packaged;                   // filled from guest memory (deswizzled upload), re-uploaded when its pages change
     uint64_t pkg_stamp; const void *pkg_span; uint64_t pkg_seen;
+    uint64_t pkg_hash;              // hash of the guest bytes it was last uploaded from (not sparse): pages written around it with its own bytes unchanged keep what the GPU wrote (gfx_vk_tex.c vk_tex)
+    int pkg_sparse; uint64_t pkg_vgen, pkg_vseen, pkg_miss;   // its storage is in a sparse pool: read through the page table, the mapping generation at upload / last looked at (gfx_vk_tex.c)
+    uint32_t sp_base;               // sparse: its first level whose pages, and those of every smaller level, are mapped (sampled views start there)
     const uint8_t *pkg_mem; size_t pkg_len; uint64_t pkg_used; int pkg_released;   // its storage, the present it was last drawn at, protection given up (vk_tex_sweep)
     uint64_t used;                  // the present it was last looked up at (vk_tex: evict_overlaps)
     uint64_t fdz_frame;             // depth images: 1 + the present at which a fragment shader that replaces depth last wrote it (gfx_vk_exec.c fdz)

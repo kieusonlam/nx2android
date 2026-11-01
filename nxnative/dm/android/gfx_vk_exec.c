@@ -453,11 +453,20 @@ void vk_crumbs_report(void) {
         shown++; VKLOG("[crumbs] then submission %u pass %d:", c->sub, c->pass);
         for (int k = 0; k < c->n; k++) VKLOG("[crumbs]   shaders %016llx %016llx %016llx", (unsigned long long)c->k[k][0], (unsigned long long)c->k[k][1], (unsigned long long)c->k[k][2]); }
 }
+// After every pass and every dispatch, a barrier and a 4-byte fill (what DM_VK_CRUMBS's marks do): Monster Hunter Rise's character maker hung the GPU within a minute
+// in its depth pre-pass (40c150f1 / e518cc4b, a shader walking a tree in a storage buffer) in 2 of 5 runs with a barrier there alone, 6 of 6 with nothing, and never
+// with the marks. Why the fill matters on Adreno is not known. DM_VK_END_MARK=0 (start-up): none
+static void end_mark(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_END_MARK"); on = !(e && !atoi(e)); }
+    if (!on || crumbs_on()) return;
+    VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb); VkBuffer b; VkDeviceSize o; vk_scratch(4, 4, &b, &o); vkCmdFillBuffer(cb, b, o, 4, 0);
+}
 void vk_end_pass(void) {
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
     if (S.pass_open == 1) { if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
     if (S.pass_open == 1) crumb_mark(0);
+    if (S.pass_open == 1) end_mark();
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
 }
 // a pass end before something that reads or writes pool memory other than through a uniform binding (copies, fills, dispatches, buffer ↔ texture
@@ -622,6 +631,10 @@ static void shader_dump(const prog_t *p, unsigned i, uint64_t kk) {
     fwrite(p->sd[i].control, 1, 0x880, f); if (ncode < (1u << 24)) fwrite((const void *)(uintptr_t)p->sd[i].data, 1, ncode, f); fclose(f);
     VKLOG("shader %016llx written to %s", (unsigned long long)kk, path);
 }
+// A program with a vertex shader and no fragment shader is a depth-only draw (NVN draws it; Vulkan too, with no fragment stage): Monster Hunter Rise's depth pre-pass,
+// whose G-buffer draws then test EQUAL, so skipping it lost the hunter's face and body in the character maker (the hair, drawn without the pre-pass, stayed).
+// Only a fragment shader the bundle lacks (g_fs_bad) still skips the draw
+static int g_fs_bad;
 static void bind_program(const p_bind_program *bp) {
     // NVN binds by stage mask (vertex 1, fragment 2, geometry 4, tessellation 8 / 0x10, compute 0x20): only the masked stages change, so a game that keeps
     // its vertex and fragment shaders in programs of their own (NEO, AI: THE SOMNIUM FILES) binds them one after the other and draws with both.
@@ -629,6 +642,7 @@ static void bind_program(const p_bind_program *bp) {
     int vk_shader_stage(uint64_t key);
     uint32_t mask = bp->stages ? (uint32_t)bp->stages & 0x3f : 0x3f;
     for (int st = 0; st < 6; st++) if (mask >> st & 1) S.sh[st] = NULL;
+    if (mask & 2) g_fs_bad = 0;
     S.prog = bp->prog;
     if (S.prog) for (unsigned i = 0; i < 6; i++) {
         uint8_t k[8]; if (!prog_key(S.prog, i, k)) break;
@@ -636,10 +650,12 @@ static void bind_program(const p_bind_program *bp) {
         if (kk && st < 0) {   // the draw or dispatch is skipped. Logged once per shader (the first 16 binds were 4 shaders of Xenoblade Chronicles 3 over and over, which hid others)
             static uint64_t seen[256]; static int nseen; int known = 0; for (int j = 0; j < nseen; j++) if (seen[j] == kk) { known = 1; break; }
             if (!known && nseen < 256) { seen[nseen++] = kk; void vk_shader_missing(uint64_t key); vk_shader_missing(kk); shader_dump(S.prog, i, kk); } }
+        if (kk && st < 0) g_fs_bad = 1;   // (a shader the bundle lacks may be the fragment one)
         if (st < 0 || st > 5 || !(mask >> st & 1)) continue;
         S.sh[st] = vk_shader(kk, st);
+        if (st == 1 && !S.sh[1]) g_fs_bad = 1;
     }
-    S.prog_ok = (S.sh[0] && (S.sh[1] || S.rast_discard)) || S.sh[5];
+    S.prog_ok = (S.sh[0] && (S.sh[1] || !g_fs_bad || S.rast_discard)) || S.sh[5];
 }
 typedef struct {
     uint64_t key[3]; uint32_t topo, restart, raster_discard, cull, front, mode, depth_clamp, bias_en;
@@ -744,7 +760,7 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
     VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, NULL, 0, k->dt, k->dt && k->dw, cmpop(k->df), 0, k->st, sf, sb, 0, 1};
     VkPipelineColorBlendAttachmentState cba[8];
     for (uint32_t i = 0; i < k->ncol; i++) cba[i] = (VkPipelineColorBlendAttachmentState){(k->blend_en >> i) & 1, bfac(k->bl[i].src), bfac(k->bl[i].dst), bop(k->bl[i].eq),
-        bfac(k->bl[i].srca), bfac(k->bl[i].dsta), bop(k->bl[i].eqa), k->wmask[i]};
+        bfac(k->bl[i].srca), bfac(k->bl[i].dsta), bop(k->bl[i].eqa), fs ? k->wmask[i] : 0};   // (no fragment shader: the colour is undefined, nothing is written)
     VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, k->logic_en, (VkLogicOp)k->logic_op, k->ncol, cba, {0, 0, 0, 0}};
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
                             VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_LINE_WIDTH};
@@ -872,7 +888,7 @@ static void cbuf_desc(int st, const vkshader_t *s, const dmsv_bind *b, VkDescrip
     uint64_t n = u && u->size ? (u->size > 65536 ? 65536 : u->size) : 65536; VkBuffer buf; VkDeviceSize off;
     vkpool_t *p = g_var_now != 9 && u && u->addr ? vk_pool_of(u->addr, 1) : NULL;
     if (!p) { *bi = (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536}; return; }
-    buf = p->buf; off = u->addr - p->lo; if (off + n > p->hi - p->lo) n = p->hi - p->lo - off;
+    buf = p->buf; off = u->addr - p->lo; if (off + n > p->hi - p->lo) n = p->hi - p->lo - off; off += p->boff;
     ubo_log(s, st, b->reg, u->addr, n);
     if (vk_ubd_shadow(u->addr, n, &buf, &off)) { *bi = (VkDescriptorBufferInfo){buf, off, n}; return; }   // deferred updates in it: their shadow
     VkDeviceSize al = V.props.limits.minUniformBufferOffsetAlignment; if (off % al) VKRED_ONCE(40, "uniform buffer at an offset not aligned to %llu", (unsigned long long)al);
@@ -936,7 +952,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
             else if (b->kind == RK_UBO_PTR && b->reg >= 0 && b->reg < 16) { a = S.ubo[st][b->reg].addr; n = S.ubo[st][b->reg].size; }
             else if (b->kind == RK_SBUF_UBO) { a = (uint64_t)ubo_word(st, b->reg, b->off) | (uint64_t)ubo_word(st, b->reg, b->off + 4) << 32; }
             vkpool_t *p = a ? vk_pool_of(a, 1) : NULL;
-            if (p) { buf = p->buf; off = a - p->lo; if (!n || off + n > p->hi - p->lo) n = p->hi - p->lo - off;
+            if (p) { buf = p->buf; off = a - p->lo; if (!n || off + n > p->hi - p->lo) n = p->hi - p->lo - off; off += p->boff;
                 // bound from the 256-byte boundary below it, the boundary the translator offsets every access from (shader_vk.py SB_ALIGN; a multiple of any device's minimum alignment)
                 const VkDeviceSize al = SB_ALIGN; if (V.props.limits.minStorageBufferOffsetAlignment > al) VKRED_ONCE(41, "storage buffer alignment %llu above %llu", (unsigned long long)V.props.limits.minStorageBufferOffsetAlignment, (unsigned long long)al);
                 bi[nw] = (VkDescriptorBufferInfo){buf, off - off % al, n + off % al};
@@ -1086,7 +1102,7 @@ static int prepare_draw(int prim, int indexed) {
     int var = g_bis_trace >= 0 && g_draw_i >= g_bis_trace ? g_bis_var : 0; if (g_bis_var) g_tracing = 0;   // full logs only the first time
     g_var_now = 0;
     if (var == 6) vk_end_pass();   // a new pass for this draw
-    if (!(S.sh[0] && (S.sh[1] || S.rast_discard))) { g_vkst.skip_prog++; VKRED_ONCE(50, "draw with a program whose shaders are not in the bundle: skipped"); return 0; }
+    if (!(S.sh[0] && (S.sh[1] || !g_fs_bad || S.rast_discard))) { g_vkst.skip_prog++; VKRED_ONCE(50, "draw with a program whose shaders are not in the bundle: skipped"); return 0; }
     if (g_x_nogs && S.sh[2]) return 0;   // DM_VK_X_NOGS=1 (live, A/B): draws with a geometry shader are left out
     for (int i = 0; i < g_x_nskipvs; i++) if (S.sh[0]->key == g_x_skipvs[i]) return 0;   // DM_VK_X_SKIPVS=<key>[,<key>...] (live, up to 8): draws with these vertex shaders are left out
     // A run of draws with rasterizer discard gets a pass of its own: the pass ends where such a run begins and where it ends (and begin_pass puts a barrier
@@ -1207,6 +1223,7 @@ static int prepare_draw(int prim, int indexed) {
         uint64_t kh = fnv(1469598103934665603ull, &k, sizeof k); VKLOG("ubo: present %llu pipeline %p key %016llx um %llx/%llx im %llx/%llx", (unsigned long long)g_tex_frame, (void *)p, (unsigned long long)kh,
               (unsigned long long)k.um[0], (unsigned long long)k.um[1], (unsigned long long)k.im[0], (unsigned long long)k.im[1]); }
     g_vkst.draws++; if (++g_pass_draws > g_vkst.max_pass_draws) g_vkst.max_pass_draws = g_pass_draws;
+    { void vk_pass_note_ps(uint64_t key); vk_pass_note_ps(S.sh[1] && !k.raster_discard ? S.sh[1]->key : 0); }
     if (p != S.bound_pipe) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); S.bound_pipe = p; }
     set_dynamic(cb);
     if (var == 1) { vkCmdSetDepthBias(cb, 0, 0, 0); memset(&g_bc.po, 0xff, sizeof g_bc.po); }
@@ -1286,7 +1303,7 @@ static int xfb_begin(VkCommandBuffer cb) {   // inside the pass, after the pipel
     for (int k = 0; k < 4; k++) {
         vkpool_t *p = g_tf[k].addr ? vk_pool_of(g_tf[k].addr + g_tf_off[k], 4) : NULL;
         if (vs->xfb_stride[k] && p && g_tf_off[k] < g_tf[k].size && vk_buf_at(g_tf[k].addr + g_tf_off[k], 4, &b[k], &o[k])) {
-            n[k] = g_tf[k].size - g_tf_off[k]; if (o[k] + n[k] > p->hi - p->lo) n[k] = p->hi - p->lo - o[k];
+            n[k] = g_tf[k].size - g_tf_off[k]; if (o[k] - p->boff + n[k] > p->hi - p->lo) n[k] = p->hi - p->lo - (o[k] - p->boff);
         } else { vk_scratch(64, 64, &b[k], &o[k]); n[k] = 64; if (vs->xfb_stride[k]) VKRED_ONCE(83, "transform feedback buffer %d unbound, full or outside the memory pools: its capture is dropped", k); }
     }
     vkCmdBindTransformFeedbackBuffersEXT(cb, 0, 4, b, o, n);
@@ -1343,8 +1360,9 @@ static void trace_draw(const char *kind, int prim, uint32_t count, uint32_t inst
               im ? im->fmt : 0, t->d.format, t->d.flags, (unsigned long long)t->L.size, (const void *)t->pool, (unsigned long long)t->off); }
     VKLOG("  scissor set %d: %d %d %d %d; depth range %.3f %.3f; viewport count first %.1f %.1f %.1f %.1f", S.sc_set, S.sc.x, S.sc.y, S.sc.w, S.sc.h, S.dnear, S.dfar, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3]);
     vkshader_t *vsh = S.sh[0]; uint32_t in_mask = vsh ? vsh->local[0] : 0;
-    for (int l = 0; l < 16; l++) if (in_mask >> l & 1) { uint32_t a = S.vattr[l]; VKLOG("  location %d: attrib state %#x (stream %u) stride %d divisor %d buffer %#llx +%llu", l, a, (a >> 16) & 0x1f,
-        S.vstream[(a >> 16) & 0xf].stride, S.vstream[(a >> 16) & 0xf].divisor, (unsigned long long)S.vbuf[(a >> 16) & 0xf].address, (unsigned long long)S.vbuf[(a >> 16) & 0xf].size); }
+    for (int l = 0; l < 16; l++) if (in_mask >> l & 1) { uint32_t a = S.vattr[l]; va_st v; memcpy(&v, &a, 4); unsigned si = v.stream & 0xf; VkBuffer vb; VkDeviceSize vo; int in = vk_buf_at(S.vbuf[si].address, 1, &vb, &vo);
+        VKLOG("  location %d: attrib state %#x (stream %u, format %u, offset %u) stride %d divisor %d buffer %#llx +%llu (vk buffer %p +%llu)", l, a, si, v.fmt, v.offset,
+        S.vstream[si].stride, S.vstream[si].divisor, (unsigned long long)S.vbuf[si].address, (unsigned long long)S.vbuf[si].size, in ? (void *)vb : NULL, (unsigned long long)vo); }
 }
 static void draw(const p_draw *d) {
     if (d->mdi_cnt) VKRED_ONCE(52, "multi-draw indirect with a count: drawn once");
@@ -1432,10 +1450,13 @@ static void dispatch(const p_dispatch *d) {
     vk_img_barrier_all(cb);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, (uint32_t)cs->ndyn, dofs);
+    void vk_disp_ts(int end, uint64_t key, uint32_t x, uint32_t y, uint32_t z); vk_disp_ts(0, 0, 0, 0, 0);
     if (d->ind) { VkBuffer b; VkDeviceSize o; if (vk_buf_at(d->ind, 12, &b, &o)) vkCmdDispatchIndirect(cb, b, o); }
     else vkCmdDispatch(cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    vk_disp_ts(1, cs->key, d->ind ? 0 : (uint32_t)d->x, d->ind ? 0 : (uint32_t)d->y, d->ind ? 0 : (uint32_t)d->z);
     vk_img_barrier_all(cb);
     if (crumbs_on()) { crumb_t *c = crumb_cur(); if (c->n < 8) { c->k[c->n][0] = 0; c->k[c->n][1] = 0; c->k[c->n][2] = cs->key; c->n++; } crumb_mark(1); }
+    end_mark();
     if (g_x_tracepass == -2) VKLOG("--- dispatch %016llx %dx%dx%d%s after pass %d", (unsigned long long)cs->key, d->x, d->y, d->z, d->ind ? " (indirect)" : "", g_sub_pass - 1);   // (DM_VK_TRACE_PASS=-2 lists the dispatches too)
 }
 

@@ -2003,8 +2003,11 @@ static uint8_t *vpool_reserve(const pool_t *o) {   // → the reserved range, or
     LOG("[nvn] virtual pool %p (%#llx bytes, flags %#x): sparse, own address range %p+%#llx, physical pages are remapped into it", (const void *)o, (unsigned long long)o->size, o->flags, a, (unsigned long long)len);
     return a;
 }
+void vk_sparse_drop(uint64_t base, uint64_t len) __attribute__((weak));   // gfx_vk_core.c: the GPU copies of a sparse pool's range
 static void vpool_release(const pool_t *o) {
-    replay_lock(); pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_of(o);
+    replay_lock();
+    { struct vpool *v = vpool_of(o); if (v && vk_sparse_drop) vk_sparse_drop((uint64_t)(uintptr_t)v->base, v->len); }   // (before g_vp_mu: the host takes its pool lock, then g_vp_mu)
+    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_of(o);
     if (v) { for (int k = 0; k < v->nrun; k++) mtl_pool_del(v->base + v->run[k].lo); munmap(v->base, v->len);
         for (uint64_t l = 0; l < (v->size + (2u << 20) - 1) >> 21; l++) free(v->pt[l]);
         free(v->pt); memset(v, 0, sizeof *v); }
@@ -2028,6 +2031,91 @@ static void vrun_set(struct vpool *v, uint64_t lo, uint64_t hi, int mapped) {
 }
 // Page table of a sparse pool (see above). Caller holds g_vp_mu
 static const vpte *vpt_get(const struct vpool *v, uint64_t o) { const vpte *l = v->pt[o >> 21]; return l ? &l[(o >> 12) & (VPT_LEAF - 1)] : NULL; }
+// The physical memory behind an address of a sparse pool's reservation (its page table), NULL when the page is unmapped or the address is in no sparse pool.
+// The Android replay registers a run of mapped pages as views of the physical pools' buffers (gfx_vk_core.c pool_add_views), from inside vrun_set: caller holds g_vp_mu
+const uint8_t *nvn_sparse_phys(uint64_t a) {
+    for (int i = 0; i < NVPOOL; i++) {
+        const struct vpool *v = &g_vp[i];
+        if (!v->base || a < (uint64_t)(uintptr_t)v->base || a >= (uint64_t)(uintptr_t)v->base + v->len) continue;
+        uint64_t o = a - (uint64_t)(uintptr_t)v->base; const vpte *e = o < v->size ? vpt_get(v, o) : NULL;
+        return e && e->phys ? e->phys + (o & 0xFFF) : NULL;
+    }
+    return NULL;
+}
+// The sparse pool whose reservation holds a (no lock: a slot is set once at Initialize, cleared at Finalize), and n bytes at a read through its page table (unmapped
+// pages as 0; → bytes not mapped). The Android replay keeps a GPU copy of the parts of the reservation buffers are bound in (gfx_vk_core.c sparse_chunk_for), synced from these
+int nvn_sparse_range(uint64_t a, uint64_t *base, uint64_t *len) {
+    for (int i = 0; i < NVPOOL; i++) { const struct vpool *v = &g_vp[i]; uint64_t b = (uint64_t)(uintptr_t)v->base;
+        if (b && a >= b && a < b + v->len) { *base = b; *len = v->len; return 1; } }
+    return 0;
+}
+static int g_vp_keep;   // vp_copy: leave dst as it is where nothing is mapped (nvn_sparse_read_mapped)
+static uint64_t vp_copy(const struct vpool *v, void *dst, uint64_t a, uint64_t n) {   // caller holds g_vp_mu
+    uint64_t miss = 0;
+    for (uint64_t p = 0, o = a - (uint64_t)(uintptr_t)v->base; p < n;) {
+        uint64_t at = o + p, k = 0x1000 - (at & 0xFFF); if (k > n - p) k = n - p;
+        const vpte *e = at < v->size ? vpt_get(v, at) : NULL;
+        if (!e && at < v->size && !v->pt[at >> 21]) { k = ((2u << 20) - (at & ((2u << 20) - 1))); if (k > n - p) k = n - p; }   // a leaf never mapped: its 2 MB at once
+        if (e && e->phys) memcpy((uint8_t *)dst + p, e->phys + (at & 0xFFF), k); else { if (!g_vp_keep) memset((uint8_t *)dst + p, 0, k); miss += k; }
+        p += k;
+    }
+    return miss;
+}
+// nvn_sparse_read into zeroed memory: the unmapped parts are not written (a fresh anonymous mapping keeps them as no memory at all)
+uint64_t nvn_sparse_read_mapped(void *dst, uint64_t a, uint64_t n) {
+    pthread_mutex_lock(&g_vp_mu); const struct vpool *v = NULL;
+    for (int i = 0; i < NVPOOL && !v; i++) if (g_vp[i].base && a >= (uint64_t)(uintptr_t)g_vp[i].base && a < (uint64_t)(uintptr_t)g_vp[i].base + g_vp[i].len) v = &g_vp[i];
+    uint64_t miss = n; if (v) { g_vp_keep = 1; miss = vp_copy(v, dst, a, n); g_vp_keep = 0; }
+    pthread_mutex_unlock(&g_vp_mu); return miss;
+}
+uint64_t nvn_sparse_read(void *dst, uint64_t a, uint64_t n) {
+    pthread_mutex_lock(&g_vp_mu); const struct vpool *v = NULL;
+    for (int i = 0; i < NVPOOL && !v; i++) if (g_vp[i].base && a >= (uint64_t)(uintptr_t)g_vp[i].base && a < (uint64_t)(uintptr_t)g_vp[i].base + g_vp[i].len) v = &g_vp[i];
+    uint64_t miss = v ? vp_copy(v, dst, a, n) : (memset(dst, 0, n), n);
+    pthread_mutex_unlock(&g_vp_mu); return miss;
+}
+// The physical pages behind [a, a+n) the CPU wrote since stamp (through the physical pools' own addresses, which the reservation's write tracking does not see): each run of
+// consecutive ones is protected again and given to fn with its offset from a, under g_vp_mu (the Android replay's sync of a sparse pool's GPU copy, gfx_vk_core.c)
+void nvn_sparse_phys_written(uint64_t a, uint64_t n, uint64_t stamp, void (*fn)(void *ctx, uint64_t off, const uint8_t *phys, uint64_t len), void *ctx) {
+    pthread_mutex_lock(&g_vp_mu); const struct vpool *v = NULL;
+    for (int i = 0; i < NVPOOL && !v; i++) if (g_vp[i].base && a >= (uint64_t)(uintptr_t)g_vp[i].base && a < (uint64_t)(uintptr_t)g_vp[i].base + g_vp[i].len) v = &g_vp[i];
+    if (!v) { pthread_mutex_unlock(&g_vp_mu); return; }
+    uint64_t o0 = a - (uint64_t)(uintptr_t)v->base, end = o0 + n < v->size ? o0 + n : v->size, ro = 0; const uint8_t *rs = NULL, *re = NULL;
+    for (uint64_t at = o0 & ~0xFFFull; at <= end; at += 0x1000) {
+        const vpte *e = at < end ? vpt_get(v, at) : NULL;
+        if (e && e->phys && rs && e->phys == re) { re += 0x1000; continue; }
+        if (rs && nvn_dirty_since(rs, (size_t)(re - rs), stamp)) { nvn_dirty_protect(rs, (size_t)(re - rs)); fn(ctx, ro - o0, rs, (uint64_t)(re - rs)); }
+        rs = NULL;
+        if (at < end && !e && !v->pt[at >> 21]) { at |= (2u << 20) - 1; at -= 0xFFF; continue; }   // a leaf never mapped: its 2 MB at once
+        if (e && e->phys) { rs = e->phys; re = rs + 0x1000; ro = at; }
+    }
+    pthread_mutex_unlock(&g_vp_mu);
+}
+// The physical pages behind [a, a+n) protected (made when a GPU copy of the range is, before it is read): the game writes a sparse pool's pages through the physical pools'
+// own addresses, zero-copy pools nothing protects, so without this no write there ever faulted and nvn_sparse_phys_written saw none (82 MB stale in Monster Hunter Rise's
+// character maker; the depth pre-pass e518cc4b walked a stale tree and hung the GPU)
+void nvn_sparse_phys_protect(uint64_t a, uint64_t n) {
+    pthread_mutex_lock(&g_vp_mu); const struct vpool *v = NULL;
+    for (int i = 0; i < NVPOOL && !v; i++) if (g_vp[i].base && a >= (uint64_t)(uintptr_t)g_vp[i].base && a < (uint64_t)(uintptr_t)g_vp[i].base + g_vp[i].len) v = &g_vp[i];
+    if (!v) { pthread_mutex_unlock(&g_vp_mu); return; }
+    uint64_t o0 = a - (uint64_t)(uintptr_t)v->base, end = o0 + n < v->size ? o0 + n : v->size; const uint8_t *rs = NULL, *re = NULL;
+    for (uint64_t at = o0 & ~0xFFFull; at <= end; at += 0x1000) {
+        const vpte *e = at < end ? vpt_get(v, at) : NULL;
+        if (e && e->phys && rs && e->phys == re) { re += 0x1000; continue; }
+        if (rs) nvn_dirty_protect(rs, (size_t)(re - rs));
+        rs = NULL;
+        if (at < end && !e && !v->pt[at >> 21]) { at |= (2u << 20) - 1; at -= 0xFFF; continue; }
+        if (e && e->phys) { rs = e->phys; re = rs + 0x1000; }
+    }
+    pthread_mutex_unlock(&g_vp_mu);
+}
+// A mapping changed the bytes behind [voff, voff+size) without a CPU write: its pages are stamped as written (dirty-page tracking of the reservation, where the host tracks
+// it: gfx_vk_core.c), so a GPU copy of them is synced again
+static void vpool_touched(struct vpool *v, uint64_t voff, uint64_t size) {
+    uint64_t pg = (uint64_t)getpagesize(), lo = voff & ~(pg - 1), hi = (voff + size + pg - 1) & ~(pg - 1);
+    if (hi > v->len) hi = v->len;
+    if (lo < hi) nvn_dirty_release(v->base + lo, hi - lo);
+}
 static void vpt_set(struct vpool *v, uint64_t voff, uint64_t size, const uint8_t *phys) {
     uint64_t gen = atomic_fetch_add(&g_vp_gen, 1) + 1;
     for (uint64_t o = 0; o < size; o += 0x1000) {
@@ -2036,6 +2124,7 @@ static void vpt_set(struct vpool *v, uint64_t voff, uint64_t size, const uint8_t
         if (!*l && !(*l = calloc(VPT_LEAF, sizeof **l))) die("sparse pool page table allocation failed");
         (*l)[((voff + o) >> 12) & (VPT_LEAF - 1)] = (vpte){phys ? phys + o : NULL, gen};
     }
+    if (phys) nvn_dirty_protect(phys, (size_t)size);   // newly mapped pages: their writes through the physical pool now fault (nvn_sparse_phys_protect)
 }
 static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp_mu; → 0 on failure
     uint64_t pg = (uint64_t)getpagesize();
@@ -2049,10 +2138,12 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
     if ((uint64_t)r->voff + r->size > v->len || ((uintptr_t)to | r->size | (uint64_t)r->voff) & (pg - 1) || (ph && (((uintptr_t)ph->mem + (uintptr_t)r->poff) & (pg - 1)))) {
         static _Atomic uint64_t n; if (!atomic_fetch_add(&n, 1)) LOG("[nvn] virtual pool %p: a request %s (%s %#llx+%#llx) is kept in the page table only: textures read it, the GPU cannot address it (later cases are not logged)",
                                                                    (const void *)v->pool, (uint64_t)r->voff + r->size > v->len ? "beyond the reservation" : "not aligned to the host page", r->phys ? "map" : "unmap", (unsigned long long)r->voff, (unsigned long long)r->size);
+        if ((uint64_t)r->voff < v->len) vpool_touched(v, (uint64_t)r->voff, r->size);
         return 1;
     }
     if (!r->phys) {   // unmap: inaccessible pages again
         if (mmap((void *)to, r->size, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) == MAP_FAILED) { LOG("[RED] virtual pool unmap %#lx+%#llx failed (errno %d)", (unsigned long)to, (unsigned long long)r->size, errno); return 0; }
+        vpool_touched(v, (uint64_t)r->voff, r->size);
         vrun_set(v, (uint64_t)r->voff, (uint64_t)r->voff + r->size, 0); return 1;
     }
     uintptr_t from = (uintptr_t)ph->mem + (uintptr_t)r->poff;
@@ -2060,6 +2151,7 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
     kern_return_t kr = vm_remap(mach_task_self(), &to, r->size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)from, FALSE, &cur, &max, VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS || to != (vm_address_t)(v->base + r->voff)) { LOG("[RED] virtual pool remap %#lx → %p (%#llx bytes) failed: %d", (unsigned long)from, (void *)(v->base + r->voff), (unsigned long long)r->size, kr); return 0; }
     mprotect((void *)to, r->size, PROT_READ | PROT_WRITE);   // the source may be write-protected by the dirty tracker at this moment; the alias itself is plain memory
+    vpool_touched(v, (uint64_t)r->voff, r->size);
     vrun_set(v, (uint64_t)r->voff, (uint64_t)r->voff + r->size, 1);
     uint64_t end = (uint64_t)r->voff + r->size;
     if (end >> 27 > v->top >> 27) LOG("[nvn] virtual pool %p: mapped up to %#llx (%d runs)", (const void *)v->pool, (unsigned long long)end, v->nrun);
@@ -2346,12 +2438,7 @@ uint64_t nvn_sparse_gen(void) { return atomic_load(&g_vp_gen); }
 uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n) {
     pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a); uint64_t miss = 0;
     if (!v) { pthread_mutex_unlock(&g_vp_mu); memset(dst, 0, n); return n; }
-    for (uint64_t p = 0, o = a - (uint64_t)(uintptr_t)v->base; p < n;) {
-        uint64_t at = o + p, k = 0x1000 - (at & 0xFFF); if (k > n - p) k = n - p;
-        const vpte *e = at < v->size ? vpt_get(v, at) : NULL;
-        if (e && e->phys) memcpy((uint8_t *)dst + p, e->phys + (at & 0xFFF), k); else { memset((uint8_t *)dst + p, 0, k); miss += k; }
-        p += k;
-    }
+    miss = vp_copy(v, dst, a, n);
     pthread_mutex_unlock(&g_vp_mu); return miss;
 }
 // Runs of consecutive physical pages behind [a, a+n): fn on each (nonzero stops the walk and is returned), or 1 at the first page mapped after gen (gen ~0 = do not look)

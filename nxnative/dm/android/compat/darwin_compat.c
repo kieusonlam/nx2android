@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -79,12 +80,20 @@ kern_return_t mach_vm_region(task_t task, mach_vm_address_t *addr, mach_vm_size_
     vm_address_t a = (vm_address_t)*addr; vm_size_t s = 0;
     kern_return_t r = vm_region_64(task, &a, &s, flavor, info, count, obj); *addr = a; *size = s; return r;
 }
-// Mapping the same pages at a second address needs shared memory; private anonymous memory (what the host maps) cannot be aliased on Linux.
+// Mapping the same pages at a second address needs shared memory; private anonymous memory cannot be aliased on Linux (copy=FALSE over it: KERN_NOT_SUPPORTED).
 // copy=TRUE (a snapshot at the target) is an eager copy into fresh pages
+int vk_pool_alias(void *dst, uint64_t src, size_t len) __attribute__((weak));   // gfx_vk_core.c
 kern_return_t vm_remap(task_t target, vm_address_t *addr, vm_size_t size, vm_address_t mask, int flags, task_t src_task, vm_address_t src, boolean_t copy,
                        vm_prot_t *cur, vm_prot_t *max, vm_inherit_t inherit) {
     (void)target; (void)mask; (void)src_task; (void)inherit;
-    if (!copy) return KERN_NOT_SUPPORTED;
+    if (!copy) {   // sharing: only zero-copy pools' pages (dma-bufs) can be mapped again: the buffer's fd mapped a second time (mremap with old size 0 refuses dma-buf mappings)
+        if (!vk_pool_alias) return KERN_NOT_SUPPORTED;
+        uint8_t *d = (flags & VM_FLAGS_ANYWHERE) ? mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) : (uint8_t *)*addr;
+        if (d == MAP_FAILED) return KERN_NO_SPACE;
+        if (vk_pool_alias(d, (uint64_t)src, size)) { if (flags & VM_FLAGS_ANYWHERE) munmap(d, size); return KERN_NOT_SUPPORTED; }
+        *addr = (vm_address_t)d; if (cur) *cur = VM_PROT_READ | VM_PROT_WRITE; if (max) *max = VM_PROT_READ | VM_PROT_WRITE;
+        return KERN_SUCCESS;
+    }
     void *hint = (flags & VM_FLAGS_ANYWHERE) ? NULL : (void *)*addr;
     void *p = mmap(hint, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | (hint ? MAP_FIXED : 0), -1, 0);
     if (p == MAP_FAILED) return KERN_NO_SPACE;
