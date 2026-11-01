@@ -208,15 +208,23 @@ static void adapt_frame(int64_t work, int64_t now) {
     // period, and with the 95th percentile against 95% of the period NEO's crowd fell back from 40 to 30 fps within 2 s every time, though pinned at
     // 40 it held 24.4 ms frames (p90 work 24.9 ms, p95 frame time 34-36 ms: no worse than its 30 fps p95 of 35-37 ms)
     if (now - g_last_change < 4000000000ll) return;
+    // 40 fps needs a display whose vsync divides 25 ms (120 or 80 Hz); the window asked for 40 at the step (dm_perf_window). A display that stayed at 60 Hz (the
+    // Retroid Pocket 5 has no other mode) showed the frames for one vsync and two in turn: Graveyard Keeper 2 had 160-170 of 300 frames off the cadence, frame
+    // p50 28 ms. There the steps are 60 and 30 fps only
+    static int no40;
+    if (g_step == 1 && !no40) {
+        double r = vk_refresh_ms(), q = r > 0 ? 25.0 / r : 0, d = q - (double)(int)(q + 0.5);
+        if (r > 0 && (d > 0.05 || d < -0.05)) { no40 = 1; g_step = 2; g_last_change = now; g_nwork = 0; g_nshown = 0; g_ok_frames = 0; LOG("[perf] adaptive frame rate: 30 fps (the display stays at %.2f ms a vsync, which 40 fps does not fit)", r); return; }
+    }
     int64_t p90 = work_pct(90); if (!p90) return;
-    int nsteps = (int)(sizeof STEPS / sizeof *STEPS);
-    if (g_step + 1 < nsteps && p90 > STEPS[g_step] * 105 / 100) {
+    int nsteps = (int)(sizeof STEPS / sizeof *STEPS), down = g_step + 1 + (no40 && g_step == 0), up = g_step - 1 - (no40 && g_step == 2);
+    if (down < nsteps && p90 > STEPS[g_step] * 105 / 100) {
         // only when the frames miss the display too: at least 1 in 10 of the last 64 on screen (as the 90th percentile), or no readings to tell
         int late = shown_late(); if (late >= 0 && late < 7) g_held_back++;   // veto only the downshift: the chosen upshift percentile may still fit
         else {
             // back down soon after a step up: the next try waits twice as long (up to a minute), so the rate does not swing between two steps
             if (g_last_up && now - g_last_up < 10000000000ll) { g_up_hold = g_up_hold * 2 > 60000000000ll ? 60000000000ll : g_up_hold * 2; }
-            g_step++; g_last_change = now; g_nwork = 0; g_nshown = 0; g_ok_frames = 0; LOG("[perf] adaptive frame rate: %.0f fps (frames p90 %.1f ms, late on screen %d of 64)", 1e9 / STEPS[g_step], p90 / 1e6, late); return; }
+            g_step = down; g_last_change = now; g_nwork = 0; g_nshown = 0; g_ok_frames = 0; LOG("[perf] adaptive frame rate: %.0f fps (frames p90 %.1f ms, late on screen %d of 64)", 1e9 / STEPS[g_step], p90 / 1e6, late); return; }
     }
     // Back up when the frames would fit the shorter period even at the clocks they get now: those clocks drop with the slack of the longer one (Viractal's board
     // took 14-16 ms a frame at 40 fps, p90 15.6, and 10-11 ms with 0 frames late at 60). A step up that does not fit shows on screen and steps back down (above)
@@ -224,7 +232,7 @@ static void adapt_frame(int64_t work, int64_t now) {
     // Unicorn Overlord's opening held 60 fps with 1-2 of 64 frames late, but once a load stepped it down to 40 its p90 stayed at 21-25 ms and it never went back
     // up (p50 14-15 ms). With 50 it tries the shorter period again; a try that does not fit misses the display and steps back down, and the next waits twice as long
     static int up_pct = -1; if (up_pct < 0) { const char *e = getenv("DM_ADAPT_UP_PCT"); up_pct = e && atoi(e) > 0 && atoi(e) < 100 ? atoi(e) : 90; }
-    if (g_step > 0 && (up_pct == 90 ? p90 : work_pct(up_pct)) < STEPS[g_step - 1]) { if (++g_ok_frames > 120 && now - g_last_change >= g_up_hold) { g_step--; g_last_change = g_last_up = now; g_nwork = 0; g_nshown = 0; g_ok_frames = 0; LOG("[perf] adaptive frame rate: %.0f fps (frames p90 %.1f ms)", 1e9 / STEPS[g_step], p90 / 1e6); } }
+    if (up >= 0 && (up_pct == 90 ? p90 : work_pct(up_pct)) < STEPS[up]) { if (++g_ok_frames > 120 && now - g_last_change >= g_up_hold) { g_step = up; g_last_change = g_last_up = now; g_nwork = 0; g_nshown = 0; g_ok_frames = 0; LOG("[perf] adaptive frame rate: %.0f fps (frames p90 %.1f ms)", 1e9 / STEPS[g_step], p90 / 1e6); } }
     else g_ok_frames = 0;
 }
 // hle_nvn.c, the first acquire after a present, right after its pacing wait. A frame's work is the time between two presents less that wait: what the
