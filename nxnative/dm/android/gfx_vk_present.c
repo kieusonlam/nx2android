@@ -11,6 +11,7 @@
 #include "font5x7.h"
 #include "overlay_vert.spv.h"
 #include "overlay_frag.spv.h"
+#include "sharpen_frag.spv.h"
 
 __attribute__((weak)) ANativeWindow *dm_front_window(void) { return NULL; }
 static uint64_t g_presents;
@@ -71,11 +72,11 @@ __attribute__((weak)) int dm_overlay_custom_ver(void) { return 0; }
 __attribute__((weak)) float dm_overlay_opacity(void) { return 0.6f; }
 __attribute__((weak)) int dm_overlay_layout(void) { return 0; }
 __attribute__((weak)) int dm_text_entry(char *title, int tcap, char *text, int xcap, int *sel, int *shift) { (void)title; (void)tcap; (void)text; (void)xcap; (void)sel; (void)shift; return 0; }
-static void pace_reset(void); static void ov_fb_drop(void);
+static void pace_reset(void); static void ov_fb_drop(void); static void sh_fb_drop(void);
 static void swap_destroy(void) {
     pace_reset();
     present_time_reset();
-    if (g_swap) { vkDeviceWaitIdle(V.dev); ov_fb_drop(); for (uint32_t i = 0; i < g_nsimg; i++) if (g_sview[i]) { vkDestroyImageView(V.dev, g_sview[i], NULL); g_sview[i] = VK_NULL_HANDLE; }
+    if (g_swap) { vkDeviceWaitIdle(V.dev); ov_fb_drop(); sh_fb_drop(); for (uint32_t i = 0; i < g_nsimg; i++) if (g_sview[i]) { vkDestroyImageView(V.dev, g_sview[i], NULL); g_sview[i] = VK_NULL_HANDLE; }
                   vkDestroySwapchainKHR(V.dev, g_swap, NULL); g_swap = VK_NULL_HANDLE; }
     if (g_surf) { vkDestroySurfaceKHR(V.inst, g_surf, NULL); g_surf = VK_NULL_HANDLE; }
 }
@@ -682,6 +683,101 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
     g_pace_target = t;
     return t - g_refresh_ns / 2;
 }
+// ---- the frame scaled with sharpening (shaders/sharpen.frag) in place of the linear blit ----
+// Monster Hunter Rise draws its 3D at 960x540 handheld and scales it to its 1280x720 window itself; the blit's second linear scale to the RP5's 1920x1080 left it soft.
+// DM_VK_SHARPEN=s (0..1, read every present; 0 or unset = the blit; settings.txt sharpen=<0..100> sets it) draws a quad sampling the window image instead, cleared black
+// around it. Without dynamic rendering (the RP5's Adreno 650 is a Vulkan 1.1 device) in a render pass object of its own, cleared, with a framebuffer per swapchain image as ov_fb
+static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet set[8]; VkSampler samp; VkPipeline pipe; VkFormat pfmt; VkImageView view[8];
+                VkRenderPass rp; VkFramebuffer fb[8]; VkImageView fbview[8]; VkExtent2D fbext[8]; } g_sh;
+static void sh_fb_drop(void) { for (int i = 0; i < 8; i++) { if (g_sh.fb[i]) vkDestroyFramebuffer(V.dev, g_sh.fb[i], NULL); g_sh.fb[i] = VK_NULL_HANDLE; g_sh.fbview[i] = VK_NULL_HANDLE; g_sh.fbext[i] = (VkExtent2D){0, 0}; } }
+static VkFramebuffer sh_fb(uint32_t idx) {
+    if (idx >= 8 || !g_sh.rp) return VK_NULL_HANDLE;
+    if (g_sh.fb[idx] && g_sh.fbview[idx] == g_sview[idx] && g_sh.fbext[idx].width == g_sext.width && g_sh.fbext[idx].height == g_sext.height) return g_sh.fb[idx];
+    if (g_sh.fb[idx]) vkDestroyFramebuffer(V.dev, g_sh.fb[idx], NULL);
+    VkFramebufferCreateInfo ci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, g_sh.rp, 1, &g_sview[idx], g_sext.width, g_sext.height, 1};
+    if (vkCreateFramebuffer(V.dev, &ci, NULL, &g_sh.fb[idx])) { VKRED_ONCE(97, "sharpening framebuffer failed (the frame is blitted)"); g_sh.fb[idx] = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    g_sh.fbview[idx] = g_sview[idx]; g_sh.fbext[idx] = g_sext;
+    return g_sh.fb[idx];
+}
+static float sharpen_level(void) { const char *e = getenv("DM_VK_SHARPEN"); float s = e ? (float)atof(e) : 0; return s > 1 ? 1 : s; }
+static int sharpen_ready(void) {
+    if (!g_sh.dsl) {
+        VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &b}; VKCHK(vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_sh.dsl));
+        VkPushConstantRange pr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 12 * sizeof(float)};
+        VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_sh.dsl, 1, &pr}; VKCHK(vkCreatePipelineLayout(V.dev, &pl, NULL, &g_sh.layout));
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8}; VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 8, 1, &ps};
+        VKCHK(vkCreateDescriptorPool(V.dev, &pi, NULL, &g_sh.pool));
+        VkDescriptorSetLayout ls[8]; for (int i = 0; i < 8; i++) ls[i] = g_sh.dsl;
+        VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_sh.pool, 8, ls}; VKCHK(vkAllocateDescriptorSets(V.dev, &ai, g_sh.set));   // one per present slot
+        VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, VK_FILTER_LINEAR, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+        VKCHK(vkCreateSampler(V.dev, &si, NULL, &g_sh.samp));
+    }
+    if (g_sh.pfmt == g_sfmt) return 1;
+    if (g_sh.pipe || g_sh.rp) { vkDeviceWaitIdle(V.dev); if (g_sh.pipe) vkDestroyPipeline(V.dev, g_sh.pipe, NULL); g_sh.pipe = VK_NULL_HANDLE;   // the swapchain's format changed (g_want)
+                                sh_fb_drop(); if (g_sh.rp) vkDestroyRenderPass(V.dev, g_sh.rp, NULL); g_sh.rp = VK_NULL_HANDLE; }
+    if (!V.has_dynrender) {   // cleared over the image sharpen_draw has just put in COLOR_ATTACHMENT_OPTIMAL
+        VkAttachmentDescription a = {0, g_sfmt, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                                     VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference ar = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sp = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &ar, NULL, NULL, 0, NULL};
+        VkRenderPassCreateInfo rpi = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &a, 1, &sp, 0, NULL};
+        if (vkCreateRenderPass(V.dev, &rpi, NULL, &g_sh.rp)) { VKRED_ONCE(98, "sharpening render pass failed (the frame is blitted)"); g_sh.rp = VK_NULL_HANDLE; return 0; }
+    }
+    VkShaderModule vm, fm;
+    VkShaderModuleCreateInfo vc = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof overlay_vert_spv, overlay_vert_spv}; VKCHK(vkCreateShaderModule(V.dev, &vc, NULL, &vm));
+    VkShaderModuleCreateInfo fc = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof sharpen_frag_spv, sharpen_frag_spv}; VKCHK(vkCreateShaderModule(V.dev, &fc, NULL, &fm));
+    VkPipelineShaderStageCreateInfo ss[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vm, "main", NULL},
+                                            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fm, "main", NULL}};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0};
+    VkPipelineViewportStateCreateInfo vs = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, 0, 0, VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0, 0, 0, 0, 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState ba = {0, 0, 0, 0, 0, 0, 0, 0xf};
+    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &ba};
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR}; VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
+    VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &g_sfmt};
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, g_sh.rp ? NULL : &rci, 0, 2, ss, &vi, &ia, NULL, &vs, &rs, &ms, NULL, &cbs, &dy, g_sh.layout, g_sh.rp};
+    VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &g_sh.pipe);
+    vkDestroyShaderModule(V.dev, vm, NULL); vkDestroyShaderModule(V.dev, fm, NULL);
+    if (r) { VKRED_ONCE(96, "sharpening pipeline failed: %d (the frame is blitted)", r); g_sh.pipe = VK_NULL_HANDLE; return 0; }
+    g_sh.pfmt = g_sfmt;
+    VKLOG("present: the frame scaled with sharpening (%s)", g_sh.rp ? "render pass object" : "dynamic rendering");
+    return 1;
+}
+// Draws source rectangle (cx, cy, cw, ch) of the window image into (dx, dy, dw, dh) of swapchain image idx, the rest black; leaves it in COLOR_ATTACHMENT_OPTIMAL. 0: not drawn
+static int sharpen_draw(VkCommandBuffer cb, uint32_t k, uint32_t idx, const vkimg_t *im, int cx, int cy, int cw, int ch, int dx, int dy, int dw, int dh) {
+    float s = sharpen_level();
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    if (s <= 0 || !sharpen_ready() || (g_sh.rp && !(fb = sh_fb(idx)))) return 0;
+    if (g_sh.view[k]) vkDestroyImageView(V.dev, g_sh.view[k], NULL);   // its present (fence k) has completed: a view made again each time, the window image may be new
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, im->img, VK_IMAGE_VIEW_TYPE_2D, im->fmt, {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    if (vkCreateImageView(V.dev, &vi, NULL, &g_sh.view[k])) { g_sh.view[k] = VK_NULL_HANDLE; return 0; }
+    VkDescriptorImageInfo ii = {g_sh.samp, g_sh.view[k], VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_sh.set[k], 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii};
+    vkUpdateDescriptorSets(V.dev, 1, &wr, 0, NULL);
+    barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkClearValue black = {.color = {{0, 0, 0, 1}}};
+    if (fb) { VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, g_sh.rp, fb, {{0, 0}, g_sext}, 1, &black}; vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE); }
+    else { VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, g_sview[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED,
+                                           VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE, black};
+           VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, g_sext}, 1, 0, 1, &ca, NULL, NULL};
+           vkCmdBeginRendering(cb, &ri); }
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sh.pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sh.layout, 0, 1, &g_sh.set[k], 0, NULL);
+    VkViewport vp = {0, 0, (float)g_sext.width, (float)g_sext.height, 0, 1}; VkRect2D sc = {{0, 0}, g_sext};
+    vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &sc);
+    float W = (float)g_sext.width, H = (float)g_sext.height, iw = (float)im->w, ih = (float)im->h;
+    float v0 = (float)cy / ih, v1 = (float)(cy + ch) / ih;
+    if (vk_window_bottom_up()) { float t = v0; v0 = v1; v1 = t; }   // lower-left origin: the window image is stored bottom-up
+    float pc[12] = {2 * dx / W - 1, 2 * dy / H - 1, 2 * (dx + dw) / W - 1, 2 * (dy + dh) / H - 1, (float)cx / iw, v0, (float)(cx + cw) / iw, v1, 1 / iw, 1 / ih, s, 0};
+    vkCmdPushConstants(cb, g_sh.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+    vkCmdDraw(cb, 6, 1, 0, 0);
+    if (fb) vkCmdEndRenderPass(cb); else vkCmdEndRendering(cb);
+    return 1;
+}
 static void present_window(vkimg_t *im, const int crop[4], double period, uint64_t ticket) {   // period: the game's frame period (s); < 0 for a redraw (ticket 0)
     uint32_t k = g_pi++ % 8;
     vkWaitForFences(V.dev, 1, &g_pfence[k], 1, UINT64_MAX);
@@ -694,16 +790,19 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     VkCommandBuffer cb = g_pcb[k];
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; vkBeginCommandBuffer(cb, &bi);
     vk_img_barrier_all(cb);   // after everything submitted before on this queue
-    barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(cb, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg);
     int cx = crop ? crop[0] : 0, cy = crop ? crop[1] : 0, cw = crop && crop[2] ? crop[2] : (int)im->w, ch = crop && crop[3] ? crop[3] : (int)im->h;
     double s = fmin((double)g_sext.width / cw, (double)g_sext.height / ch); int dw = (int)(cw * s), dh = (int)(ch * s), dx = ((int)g_sext.width - dw) / 2, dy = ((int)g_sext.height - dh) / 2;
     vk_pic_set((float)dx / g_sext.width, (float)dy / g_sext.height, (float)dw / g_sext.width, (float)dh / g_sext.height);
-    VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
-    if (vk_window_bottom_up()) { b.srcOffsets[0].y = cy + ch; b.srcOffsets[1].y = cy; }   // lower-left origin: the window image is stored bottom-up (gfx_vk_exec.c)
-    vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
-    VkImageLayout lay = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VkImageLayout lay = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    if (!sharpen_draw(cb, k, idx, im, cx, cy, cw, ch, dx, dy, dw, dh)) {
+        barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg);
+        VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
+        if (vk_window_bottom_up()) { b.srcOffsets[0].y = cy + ch; b.srcOffsets[1].y = cy; }   // lower-left origin: the window image is stored bottom-up (gfx_vk_exec.c)
+        vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        lay = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    }
     int ovm = dm_overlay_visible(), menu = dm_menu_state(), fps = dm_overlay_fps();
     if ((ovm || menu >= 0 || fps) && overlay_ready(cb, k, menu) && (V.has_dynrender || ov_fb(idx))) {   // without dynamic rendering, only with the image's framebuffer
         barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); lay = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -722,7 +821,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     }
     barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     vkEndCommandBuffer(cb);
-    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;   // the blit, or the sharpened quad (sharpen_draw)
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &g_acq[k], &ws, 1, &cb, 1, &g_done_sem[k]};
     extern pthread_mutex_t g_vk_queue_mu;
     pthread_mutex_lock(&g_vk_queue_mu);
@@ -847,6 +946,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
           VKLOG("uniform reads per frame (last 600): %.0f from one deferred update, %.0f the long way (%.2f ms, %.0f in-flight updates each)", (g_ubd_fast - pf) / 600.0, (g_ubd_slow - pl) / 600.0,
                 (g_ns_ubd_slow - pt) / 6e8, g_ubd_slow > pl ? (double)(g_ubd_infl_sum - pi) / (double)(g_ubd_slow - pl) : 0.0);
           pf = g_ubd_fast; pl = g_ubd_slow; pt = g_ns_ubd_slow; pi = g_ubd_infl_sum; }
+        { extern uint64_t g_order_kept, g_order_ended; static uint64_t pk, pn;   // gfx_vk_exec.c g_order_keep
+          if (g_order_kept + g_order_ended > pk + pn) VKLOG("order-only barriers per frame (last 600): %.1f kept inside their pass, %.1f ended it", (g_order_kept - pk) / 600.0, (g_order_ended - pn) / 600.0);
+          pk = g_order_kept; pn = g_order_ended; }
         void vk_pass_report(void); vk_pass_report();
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }

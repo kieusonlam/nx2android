@@ -50,6 +50,8 @@ static char g_root[512];
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
 static _Atomic int g_set_abxy_label;   // settings.txt abxy_label=1: face buttons by their printed letter (BUTTON_A = A), for devices such as the Retroid Pocket 5 whose letters follow the keycodes
+static _Atomic int g_set_sharpen = -1;   // settings.txt sharpen=<0..100>: the frame scaled to the window with that much sharpening (DM_VK_SHARPEN, gfx_vk_present.c); -1: env.txt's
+static _Atomic int g_set_rscale = -1;   // settings.txt render_scale=<50..100>: the game's 3D rendered at that percent of its size (DM_RENDER_SCALE, hle_fpslock.c); -1: env.txt's
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
 // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1)
 static _Atomic int g_cust[2][2][DM_AOV_N][3], g_cust_ver, g_edit;
@@ -62,6 +64,8 @@ static void settings_load(void) {
     while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
         else if (sscanf(line, "abxy_label=%d", &v) == 1) atomic_store(&g_set_abxy_label, v != 0);
+        else if (sscanf(line, "sharpen=%d", &v) == 1) { v = v < 0 ? 0 : v > 100 ? 100 : v; atomic_store(&g_set_sharpen, v); char s[16]; snprintf(s, sizeof s, "%.2f", v / 100.0); setenv("DM_VK_SHARPEN", s, 1); }
+        else if (sscanf(line, "render_scale=%d", &v) == 1) { v = v < 50 ? 50 : v > 100 ? 100 : v; atomic_store(&g_set_rscale, v); char s[16]; snprintf(s, sizeof s, "%.2f", v / 100.0); setenv("DM_RENDER_SCALE", s, 1); }
         else if (sscanf(line, "docked=%d", &v) == 1) setenv("DM_OPMODE", v ? "1" : "0", 1);   // over env.txt's: the host reads it once, at its first query
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
@@ -82,6 +86,8 @@ static void settings_save(void) {
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
             atomic_load(&g_set_opacity));
     if (atomic_load(&g_set_abxy_label)) fprintf(f, "abxy_label=1\n");
+    if (atomic_load(&g_set_sharpen) >= 0) fprintf(f, "sharpen=%d\n", atomic_load(&g_set_sharpen));
+    if (atomic_load(&g_set_rscale) >= 0) fprintf(f, "render_scale=%d\n", atomic_load(&g_set_rscale));
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
         if ((x && y) || z) fprintf(f, "ui=%s,%s,%d,%d,%d\n", LAYOUT_NAMES[l], OV_LAYOUTS[0][i].name, x && y ? x - 1 : -1, x && y ? y - 1 : -1, z ? z : 1000);

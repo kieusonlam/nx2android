@@ -150,8 +150,37 @@ static void imp_tick(uint8_t *base, int target) {
     }
 }
 
+// Render scale kept in game memory (DM_RENDER_SCALE, 0.5 to 1.0; unset or 1.0 = the game's own size): the fraction of the window an engine renders its 3D at, multiplied by the factor.
+// Monster Hunter Rise 16.0.2: two floats at [main+0x126ab170], handheld then docked (0.75: 960x540 of 1280x720; 0.7: 1344x756 of 1920x1080), stored once at boot (main+0x716104:
+// mov/movk x9 + str x9,[x8]) and read through a getter by operation mode (main+0x7160c4). Found from masagrator's MonHunRiseResPlugin, which patches that store. Written only over
+// the game's own values, so a size the game sets itself later is kept
+static const struct { const char *build, *what; uint64_t ptr_off; float v[2]; } k_scales[] = {
+    { "c9a3dd7702075ecd90101f4555389582", "RE Engine 3D resolution (handheld, docked)", 0x126ab170, {0.75f, 0.7f} },
+};
+static void render_scale_tick(void) {
+    static int state = -2, k; static uint8_t *base; static float sc;
+    if (state == -1) return;
+    if (state == -2) {
+        state = -1;
+        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
+            for (int j = 0; j < (int)(sizeof k_scales / sizeof k_scales[0]); j++) if (!strcmp(g_mod[i].build_id, k_scales[j].build)) { k = j; base = g_mod[i].base; }
+        const char *e = getenv("DM_RENDER_SCALE"); if (!base || !e) return;
+        char *end; sc = strtof(e, &end);
+        if (end == e || *end || !(sc >= 0.5f && sc <= 1.0f)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to 1.0; keeping the game's size", e); return; }
+        if (sc == 1.0f) return;
+        state = 0;
+    }
+    uint64_t obj; float cur[2];
+    if (!rd((uint64_t)(uintptr_t)(base + k_scales[k].ptr_off), &obj, sizeof obj) || !obj || !rd(obj, cur, sizeof cur)) return;   // not created yet
+    if (cur[0] != k_scales[k].v[0] || cur[1] != k_scales[k].v[1]) return;   // already scaled, or a size of the game's own
+    float want[2] = {k_scales[k].v[0] * sc, k_scales[k].v[1] * sc};
+    float *p = (float *)(uintptr_t)obj; dm_guest_write_prepare(p, sizeof want); memcpy(p, want, sizeof want);
+    if (state++ < 8) LOG("main: %s %g, %g → %g, %g (DM_RENDER_SCALE %g)", k_scales[k].what, cur[0], cur[1], want[0], want[1], sc);
+}
+
 void dm_fps_lock_tick(void) {
     static int state = -2, rows[NLOCKS], nrow, nlog[NLOCKS], target; static uint8_t *base; static const char *src;
+    render_scale_tick();
     if (state == -1) return;
     if (state == -2) {
         state = -1;
