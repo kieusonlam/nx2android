@@ -49,6 +49,7 @@ void dm_focus_set(int st); void dm_audio_suspend(int on); void guest_clock_freez
 static char g_root[512];
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
+static _Atomic int g_set_abxy_label;   // settings.txt abxy_label=1: face buttons by their printed letter (BUTTON_A = A), for devices such as the Retroid Pocket 5 whose letters follow the keycodes
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
 // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1)
 static _Atomic int g_cust[2][2][DM_AOV_N][3], g_cust_ver, g_edit;
@@ -60,6 +61,7 @@ static void settings_load(void) {
     if (!f) return;
     while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
+        else if (sscanf(line, "abxy_label=%d", &v) == 1) atomic_store(&g_set_abxy_label, v != 0);
         else if (sscanf(line, "docked=%d", &v) == 1) setenv("DM_OPMODE", v ? "1" : "0", 1);   // over env.txt's: the host reads it once, at its first query
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
@@ -79,6 +81,7 @@ static void settings_save(void) {
     FILE *f = fopen(tmp, "w"); if (!f) { LOG("[RED] cannot write %s", tmp); return; }
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
             atomic_load(&g_set_opacity));
+    if (atomic_load(&g_set_abxy_label)) fprintf(f, "abxy_label=1\n");
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
         if ((x && y) || z) fprintf(f, "ui=%s,%s,%d,%d,%d\n", LAYOUT_NAMES[l], OV_LAYOUTS[0][i].name, x && y ? x - 1 : -1, x && y ? y - 1 : -1, z ? z : 1000);
@@ -114,6 +117,9 @@ static void on_destroy(ANativeActivity *a) { (void)a; _exit(0); }   // one game 
 static AInputQueue *g_queue; static ALooper *g_ilooper;
 static uint64_t g_btn; static float g_ax[8]; static int g_pad_used;   // lx ly rx ry lt rt hatx haty
 static uint64_t key_bit(int32_t k) {   // Nintendo layout by position: the bottom face button is B, the right one A (as the iOS front end maps)
+    if (atomic_load(&g_set_abxy_label)) switch (k) {
+    case AKEYCODE_BUTTON_A: return DM_BTN_A; case AKEYCODE_BUTTON_B: return DM_BTN_B; case AKEYCODE_BUTTON_X: return DM_BTN_X; case AKEYCODE_BUTTON_Y: return DM_BTN_Y;
+    }
     switch (k) {
     case AKEYCODE_BUTTON_A: return DM_BTN_B; case AKEYCODE_BUTTON_B: return DM_BTN_A; case AKEYCODE_BUTTON_X: return DM_BTN_Y; case AKEYCODE_BUTTON_Y: return DM_BTN_X;
     case AKEYCODE_BUTTON_L1: return DM_BTN_L; case AKEYCODE_BUTTON_R1: return DM_BTN_R; case AKEYCODE_BUTTON_L2: return DM_BTN_ZL; case AKEYCODE_BUTTON_R2: return DM_BTN_ZR;

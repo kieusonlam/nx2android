@@ -75,7 +75,8 @@ void crash_off(const char *tag, uint64_t a) {   // Also used by diag.c
     module_t *m = module_of((void *)a);
     Dl_info di;
     if (m) fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", m->name, a - (uint64_t)m->base);
-    else if (dladdr((void *)a, &di) && di.dli_sname) fprintf(stderr, " %s%s%s+%#lx", tag, *tag ? "=" : "", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
+    else if (dladdr((void *)a, &di) && di.dli_sname) fprintf(stderr, " %s%s%s+%#lx(%s+%#lx)", tag, *tag ? "=" : "", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr), di.dli_fname && strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : "?", (unsigned long)(a - (uint64_t)di.dli_fbase));
+    else if (a > 0x100000000ull && dladdr((void *)a, &di) && di.dli_fname) fprintf(stderr, " %s%s%s+%#lx", tag, *tag ? "=" : "", strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname, (unsigned long)(a - (uint64_t)di.dli_fbase));
     else fprintf(stderr, " %s%s%#llx", tag, *tag ? "=" : "", a);
 }
 // Frame pointer backtrace: x29 chain [fp]=previous frame's fp, [fp+8]=return address; only 8-byte aligned, monotonically increasing frames are walked.
@@ -153,7 +154,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     funlockfile(stderr);
     fprintf(stderr, "[dm] CRASH sig=%d", sig);
     off("addr", (uint64_t)si->si_addr); off("pc", DM_UC_SS(uc)->__pc); off("lr", DM_UC_SS(uc)->__lr);
-    fprintf(stderr, " sp=%#llx\n", DM_UC_SS(uc)->__sp);
+    fprintf(stderr, " sp=%#llx tid=%d\n", DM_UC_SS(uc)->__sp, (int)gettid());
     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, DM_UC_SS(uc)->__x[i], i % 6 == 5 ? "\n" : " ");
     fprintf(stderr, "\n");
     // What the registers point at: the first six words of each readable target (read with vm_read_overwrite, which fails instead of faulting); a word inside a module prints as a module offset, so an object's vtable names its class
