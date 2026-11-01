@@ -112,7 +112,8 @@ static class SwshXlate
             Array32<AttributeType> attr = default; Array8<AttributeType> fout = default;
             if (_job["attr"] is JsonObject a) foreach (var kv in a) attr[int.Parse(kv.Key)] = Attr((string)kv.Value);
             if (_job["fout"] is JsonObject f) foreach (var kv in f) fout[int.Parse(kv.Key)] = Attr((string)kv.Value);
-            return new GpuGraphicsState(false, _job["geometry_topology"] is JsonNode gt ? (InputTopology)(int)gt : InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
+            // Job "early_z" (shader_vk.py job_for, from the control section): the fragment shader's layout(early_fragment_tests), as NVN sets FORCE_EARLY_FRAGMENT_TESTS for it
+            return new GpuGraphicsState(_job["early_z"] is JsonNode ez && (bool)ez, _job["geometry_topology"] is JsonNode gt ? (InputTopology)(int)gt : InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
                 false, false, false, false /* depth not rewritten: dmsh_build.py adds the GL entry point (see the file header) */, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
                 false /* no Y flip */, true /* origin upper-left */, false);
         }
@@ -145,6 +146,11 @@ static class SwshXlate
         // Job softfloat64 = true: the host has no FP64, so Ryujinx's DoubleToFloat pass lowers double operations to float (Metal has no double type). Set only on the retry of a
         // shader whose first translation declared a 64-bit float (see Main): answering "no" for every shader would also drop the Float64 capability from all the others
         public bool QueryHostSupportsShaderFloat64() => !(_job["softfloat64"] is JsonNode n && (bool)n);
+        // Job "subgroup" (the Android chain: 128): the host's subgroup size. Maxwell code counts on 32-lane warps; above 32 the translator takes the lane id modulo 32,
+        // the ballot word of the lane's own 32 lanes and shuffles within them. With 32 assumed on Adreno (64 lanes), Monster Hunter Rise's normal accumulation (compute
+        // 48dd217e86f3d34b) added the sum of lanes 0-31 from lane 0 alone and lost lanes 32-63: 55 of the face's 1,205 vertices kept a zero normal (black patches on the faces).
+        // 128 also serves 64- and 32-lane devices (the lane's 32-lane group is lane >> 5)
+        public int QueryHostSubgroupSize() => _job["subgroup"] is JsonNode n ? (int)n : 32;
     }
 
     // True when the SPIR-V declares a 64-bit float type (OpTypeFloat 64): SPIRV-Cross then writes double, which the Metal compiler rejects
