@@ -505,7 +505,7 @@ class Port:
         nsp.run([PY, DM / 'android/tools/shader_vk.py', pkg, tmp, '--jobs', str(self.o.jobs), '--dotnet', self.tools['dotnet'], '--xlate', xlate, '--capture', cap],
                 self.logs / 'android_shaders.log', env=self.env, on_line=line)
         m = re.search(r'^(\d+) of (\d+) shaders', (self.logs / 'android_shaders.log').read_text(errors='replace'), re.M)
-        if not m or m.group(1) == '0': raise BuildError(f'no shader translated (see {self.logs / "android_shaders.log"})')
+        if not m or (m.group(1) == '0' and not (m.group(2) == '0' and self.env.get('DM_SPLIT_EMPTY') == '1')): raise BuildError(f'no shader translated (see {self.logs / "android_shaders.log"})')
         note = f'{int(m.group(1)):,} of {int(m.group(2)):,} shaders, {tmp.stat().st_size / 2**20:,.0f} MB'
         nsp.swap_in(tmp, self.dmsv); kf.write_text(f'{key}\n{note}\n')
         PROG.end(note)

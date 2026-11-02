@@ -278,7 +278,7 @@ def main():
         jp = os.path.join(w, f'job_{abs(hash(ch[0]))}.json'); json.dump([jobs[k] for k in ch], open(jp, 'w'))
         return subprocess.run([a.dotnet, XLATE_DLL, jp, w], capture_output=True, text=True, errors='replace')
     print(f'translating {len(keys)} shaders in {len(chunks)} batches ...', flush=True)
-    with cf.ThreadPoolExecutor(len(chunks)) as ex: rs = list(ex.map(xl, chunks))
+    with cf.ThreadPoolExecutor(max(1, len(chunks))) as ex: rs = list(ex.map(xl, chunks))
     errs = collections.Counter()
     for r in rs:
         for ln in r.stderr.splitlines():
