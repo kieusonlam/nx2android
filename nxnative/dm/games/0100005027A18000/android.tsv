@@ -13,3 +13,6 @@ status	playable
 tested	v262144 Lenovo Legion Y700 TB322FC (Snapdragon 8 Elite, Adreno 830, Android 16)
 package	org.nx2a.graveyardkeeper2
 orientation	landscape
+# back up to 60 fps judged on the median frame: on the Retroid Pocket 5 (Adreno 650, Standard performance mode) the Yard held 60 with 0 of 3,900 frames late
+# pinned, but once a load stepped it down to 30 its p90 stayed at 19-21 ms (the slower clocks: 10.5 ms of render-thread CPU a frame against 7.5) and it never went back up
+env	DM_ADAPT_UP_PCT=50
