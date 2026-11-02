@@ -47,38 +47,46 @@ int vk_shader_stage(uint64_t key) { bundle_auto(); const bent *e = g_bundle ? fi
 // Xenoblade Chronicles 3 sets hundreds of programs whose code is in no game file (GLSLC outputs of its Firehawk effects, and vertex / pixel shaders of models: a machine near
 // the camera in Everlight Plain drew as a black silhouette, its depth pre-pass drawn and its G-buffer draw skipped); 51 of them in the opening and the first field.
 // The game may free a control section once SetShaders returns, so SetShaders keeps a copy of each one the bundle lacks (shader_set); the file is written only when a draw misses
-// the key (vk_shader_missing) and the code area then still hashes to it
-typedef struct { uint64_t key, data; uint32_t nctl, ncode; uint8_t *ctl; } pend_t;
+// the key (vk_shader_missing) and the code area then still hashes to it. Diablo III reuses its code memory for the next shaders before the replay thread resolves the draw
+// (71 of 109 missed shaders in the first field were "changed since SetShaders"), so the code area is copied at SetShaders too, once per key, and the hash checked on that copy
+typedef struct { uint64_t key, data; uint32_t nctl, ncode; uint8_t *ctl, *code; } pend_t;
 enum { NPEND = 4096 };
 static pend_t g_pend[NPEND]; static unsigned g_npend; static pthread_mutex_t g_pend_mu = PTHREAD_MUTEX_INITIALIZER;
 static void shader_set(const uint8_t k[8], const void *control, uint64_t data, uint32_t ncode) {
     uint64_t key = 0; for (int i = 0; i < 8; i++) key = key << 8 | k[i];
     if (!key || !control || !data || !ncode || ncode >= (1u << 24) || vk_shader_stage(key) >= 0) return;
     uint32_t nctl = 0x880, own; memcpy(&own, (const uint8_t *)control + 0x20, 4); if (own >= 0x760 && own < 0x880) nctl = own;   // as hle_nvn.c keys_hash
-    uint8_t *c = malloc(nctl); if (!c) return; memcpy(c, control, nctl);
     pthread_mutex_lock(&g_pend_mu);
-    pend_t *p = &g_pend[g_npend++ % NPEND]; free(p->ctl); *p = (pend_t){key, data, nctl, ncode, c};   // the oldest goes: a draw needs a program soon after it is set
+    for (unsigned i = 0; i < NPEND && i < g_npend; i++) if (g_pend[i].key == key && g_pend[i].code) { pthread_mutex_unlock(&g_pend_mu); return; }   // kept already
+    pthread_mutex_unlock(&g_pend_mu);
+    uint8_t *c = malloc(nctl), *code = malloc(ncode); if (!c || !code) { free(c); free(code); return; }
+    memcpy(c, control, nctl); memcpy(code, (const void *)(uintptr_t)data, ncode);
+    pthread_mutex_lock(&g_pend_mu);
+    pend_t *p = &g_pend[g_npend++ % NPEND]; free(p->ctl); free(p->code); *p = (pend_t){key, data, nctl, ncode, c, code};   // the oldest goes: a draw needs a program soon after it is set
     pthread_mutex_unlock(&g_pend_mu);
 }
 __attribute__((constructor)) static void shader_set_on(void) { extern void (*g_nvn_on_shader)(const uint8_t *, const void *, uint64_t, uint32_t); g_nvn_on_shader = shader_set; }
 void vk_shader_missing(uint64_t key) {
     pend_t p = {0};
     pthread_mutex_lock(&g_pend_mu);
-    for (unsigned i = 0; i < NPEND && i < g_npend; i++) if (g_pend[i].key == key && g_pend[i].ctl) { p = g_pend[i]; p.ctl = malloc(p.nctl); if (p.ctl) memcpy(p.ctl, g_pend[i].ctl, p.nctl); break; }
+    for (unsigned i = 0; i < NPEND && i < g_npend; i++) if (g_pend[i].key == key && g_pend[i].ctl) {
+        p = g_pend[i]; p.ctl = malloc(p.nctl); p.code = malloc(p.ncode);
+        if (p.ctl && p.code) { memcpy(p.ctl, g_pend[i].ctl, p.nctl); memcpy(p.code, g_pend[i].code, p.ncode); } else { free(p.ctl); free(p.code); p.ctl = p.code = NULL; }
+        break; }
     pthread_mutex_unlock(&g_pend_mu);
     if (!p.ctl) { VKLOG("[RED] shader %016llx is not in the bundle (and was not set while the capture could see it)", (unsigned long long)key); return; }
-    uint8_t md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_CTX hc; CC_SHA256_Init(&hc); CC_SHA256_Update(&hc, p.ctl, p.nctl); CC_SHA256_Update(&hc, (const void *)(uintptr_t)p.data, p.ncode); CC_SHA256_Final(md, &hc);
+    uint8_t md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_CTX hc; CC_SHA256_Init(&hc); CC_SHA256_Update(&hc, p.ctl, p.nctl); CC_SHA256_Update(&hc, p.code, p.ncode); CC_SHA256_Final(md, &hc);
     uint64_t now = 0; for (int i = 0; i < 8; i++) now = now << 8 | md[i];
-    if (now != key) { VKLOG("[RED] shader %016llx is not in the bundle; its code area changed since SetShaders, not saved", (unsigned long long)key); free(p.ctl); return; }
+    if (now != key) { VKLOG("[RED] shader %016llx is not in the bundle; its code area changed since SetShaders, not saved", (unsigned long long)key); free(p.ctl); free(p.code); return; }
     const char *r = getenv("DM_ROOT"); char dir[1024], path[1100], tmp[1110]; snprintf(dir, sizeof dir, "%s/captured_shaders", r ? r : "."); mkdir(dir, 0755);
     snprintf(path, sizeof path, "%s/%016llx.bin", dir, (unsigned long long)key); snprintf(tmp, sizeof tmp, "%s.part", path);
-    struct stat st; if (!stat(path, &st)) { VKLOG("[RED] shader %016llx is not in the bundle: captured in %s by an earlier run, the next port translates it", (unsigned long long)key, path); free(p.ctl); return; }
+    struct stat st; if (!stat(path, &st)) { VKLOG("[RED] shader %016llx is not in the bundle: captured in %s by an earlier run, the next port translates it", (unsigned long long)key, path); free(p.ctl); free(p.code); return; }
     FILE *f = fopen(tmp, "wb"); uint32_t hdr[3] = {0x43534d44, p.nctl, p.ncode};   // "DMSC"
-    int ok = f && fwrite(hdr, 1, 12, f) == 12 && fwrite(p.ctl, 1, p.nctl, f) == p.nctl && fwrite((const void *)(uintptr_t)p.data, 1, p.ncode, f) == p.ncode;
+    int ok = f && fwrite(hdr, 1, 12, f) == 12 && fwrite(p.ctl, 1, p.nctl, f) == p.nctl && fwrite(p.code, 1, p.ncode, f) == p.ncode;
     if (f && fclose(f)) ok = 0;
     if (!ok || rename(tmp, path)) { VKLOG("[RED] shader %016llx is not in the bundle, and %s could not be written", (unsigned long long)key, path); unlink(tmp); }
     else VKLOG("[RED] shader %016llx is not in the bundle: saved to %s, the next port translates it", (unsigned long long)key, path);
-    free(p.ctl);
+    free(p.ctl); free(p.code);
 }
 static VkShaderStageFlags stage_flag(int st) {
     switch (st) { case 0: return VK_SHADER_STAGE_VERTEX_BIT; case 1: return VK_SHADER_STAGE_FRAGMENT_BIT; case 2: return VK_SHADER_STAGE_GEOMETRY_BIT;
