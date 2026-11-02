@@ -53,6 +53,7 @@ static char g_root[512];
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
 static _Atomic int g_set_abxy_label;   // settings.txt abxy_label=1: face buttons by their printed letter (BUTTON_A = A), for devices such as the Retroid Pocket 5 whose letters follow the keycodes
+static _Atomic int g_set_pad_ready;   // settings.txt pad_ready=1: a controller attached counts as in use at once (the gamepad hidden from the first frame), for built-in controls such as the Retroid Pocket 5's
 static _Atomic int g_set_sharpen = -1;   // settings.txt sharpen=<0..100>: the frame scaled to the window with that much sharpening (DM_VK_SHARPEN, gfx_vk_present.c); -1: env.txt's
 static _Atomic int g_set_rscale = -1;   // settings.txt render_scale=<50..100>: the game's 3D rendered at that percent of its size (DM_RENDER_SCALE, hle_fpslock.c); -1: env.txt's
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
@@ -68,6 +69,7 @@ static void settings_load(void) {
     while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
         else if (sscanf(line, "abxy_label=%d", &v) == 1) atomic_store(&g_set_abxy_label, v != 0);
+        else if (sscanf(line, "pad_ready=%d", &v) == 1) atomic_store(&g_set_pad_ready, v != 0);
         else if (sscanf(line, "sharpen=%d", &v) == 1) { v = v < 0 ? 0 : v > 100 ? 100 : v; atomic_store(&g_set_sharpen, v); char s[16]; snprintf(s, sizeof s, "%.2f", v / 100.0); setenv("DM_VK_SHARPEN", s, 1); }
         else if (sscanf(line, "render_scale=%d", &v) == 1) { v = v < 50 ? 50 : v > 100 ? 100 : v; atomic_store(&g_set_rscale, v); char s[16]; snprintf(s, sizeof s, "%.2f", v / 100.0); setenv("DM_RENDER_SCALE", s, 1); }
         else if (sscanf(line, "docked=%d", &v) == 1) setenv("DM_OPMODE", v ? "1" : "0", 1);   // over env.txt's: the host reads it once, at its first query
@@ -91,6 +93,7 @@ static void settings_save(void) {
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
             atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
     if (atomic_load(&g_set_abxy_label)) fprintf(f, "abxy_label=1\n");
+    if (atomic_load(&g_set_pad_ready)) fprintf(f, "pad_ready=1\n");
     if (atomic_load(&g_set_sharpen) >= 0) fprintf(f, "sharpen=%d\n", atomic_load(&g_set_sharpen));
     if (atomic_load(&g_set_rscale) >= 0) fprintf(f, "render_scale=%d\n", atomic_load(&g_set_rscale));
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
@@ -252,7 +255,7 @@ static void *pad_watch(void *a) {
                 jint src = (*E)->CallIntMethod(E, d, mSrc); jboolean virt = (*E)->CallBooleanMethod(E, d, mVirt);
                 if (!jx(E) && !virt && ((src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK)) {
                     int known = 0, was = 0; for (int k = 0; k < np; k++) if (prev[k] == v[i]) { known = 1; was = used[k]; }
-                    ids[n] = v[i]; on[n] = was || v[i] == in; nu += on[n];
+                    ids[n] = v[i]; on[n] = was || v[i] == in || atomic_load(&g_set_pad_ready); nu += on[n];
                     if (!known) {
                         jstring s = (*E)->CallObjectMethod(E, d, mName); const char *nm = !jx(E) && s ? (*E)->GetStringUTFChars(E, s, NULL) : NULL;
                         jint ven = (*E)->CallIntMethod(E, d, mVen), prod = (*E)->CallIntMethod(E, d, mProd); jx(E);
@@ -260,7 +263,8 @@ static void *pad_watch(void *a) {
                         if (nm) (*E)->ReleaseStringUTFChars(E, s, nm);
                         if (s) (*E)->DeleteLocalRef(E, s);
                     }
-                    if (on[n] && !was) LOG("[input] controller in use (device %d): the gamepad is hidden", v[i]);
+                    if (on[n] && !was) { LOG("[input] controller in use (device %d)%s: the gamepad is hidden", v[i], v[i] == in ? "" : ", pad_ready=1");
+                        if (in < 0) dm_haptics_android_device(v[i]); }   // pad_ready: its motor for rumble before its first key
                     n++;
                 }
                 (*E)->DeleteLocalRef(E, d);
