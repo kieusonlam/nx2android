@@ -7,6 +7,7 @@
 #include "nvn_hmap.h"
 #include <math.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -815,6 +816,7 @@ typedef struct {
     uint64_t um[3], im[3];   // each stage's sampled bindings given integer views (vk_shader_module)
 } pkey;
 static nvn_hmap g_pipes = {.klen = sizeof(pkey)}; static pthread_mutex_t g_pipe_mu = PTHREAD_MUTEX_INITIALIZER;   // the replay thread and the prewarm threads
+static void pipe_stats(VkPipeline p, const uint64_t *key);   // (below: DM_VK_PIPE_STATS)
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]);
 static void pipe_record(const pkey *k);
 // The last key and its pipeline (the replay thread's only; pipelines are never dropped): runs of draws with one pipeline skip the 992-byte hash and the lock
@@ -980,12 +982,65 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
     VkRenderPass prp = rp_on() ? rp_compat(k->ncol, k->cfmt, k->dfmt, k->samples) : VK_NULL_HANDLE;   // with render passes, pipelines are made against a compatible one
     if (!prp && !V.has_dynrender) return (VkPipeline)1;   // no compatible render pass and no dynamic rendering: no valid pipeline (pass_commit skips such passes)
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, prp ? NULL : &rci, 0, ns, ss, &vi, &ia, NULL, &vs, &rs, &ms, &ds, &cb, &dy, layout, prp, 0, VK_NULL_HANDLE, -1};
+    if (V.pipe_stats) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | (getenv("DM_VK_PIPE_IR") ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR : 0);
     VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p);
+    if (!r && V.pipe_stats) pipe_stats(p, k->key);
     static uint64_t n; uint64_t c = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
     if (r) { LOG("[RED] [vk] graphics pipeline failed (%d): shaders %016llx %016llx %016llx", r, (unsigned long long)k->key[0], (unsigned long long)k->key[1], (unsigned long long)k->key[2]); p = (VkPipeline)1; }
     else if (c % 200 == 0) VKLOG("%llu graphics pipelines", (unsigned long long)c);
     __atomic_add_fetch(&g_vkst.pipes_built, 1, __ATOMIC_RELAXED);
     return p;   // (VkPipeline)1 = failed
+}
+
+// DM_VK_PIPE_STATS=1: one log line per executable (stage) of each new graphics pipeline, with the driver's statistics, as D2R Mobile's gfx-pipe-stats
+static void pipe_stats(VkPipeline p, const uint64_t *key) {
+    static PFN_vkGetPipelineExecutablePropertiesKHR gp; static PFN_vkGetPipelineExecutableStatisticsKHR gs;
+    if (!gp) { gp = (PFN_vkGetPipelineExecutablePropertiesKHR)vkGetDeviceProcAddr(V.dev, "vkGetPipelineExecutablePropertiesKHR");
+               gs = (PFN_vkGetPipelineExecutableStatisticsKHR)vkGetDeviceProcAddr(V.dev, "vkGetPipelineExecutableStatisticsKHR"); }
+    if (!gp || !gs) return;
+    VkPipelineInfoKHR pi = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, NULL, p}; uint32_t ne = 0;
+    if (gp(V.dev, &pi, &ne, NULL) || !ne) return;
+    VkPipelineExecutablePropertiesKHR ep[8]; if (ne > 8) ne = 8;
+    for (uint32_t i = 0; i < ne; i++) ep[i] = (VkPipelineExecutablePropertiesKHR){VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
+    gp(V.dev, &pi, &ne, ep);
+    for (uint32_t i = 0; i < ne; i++) {
+        VkPipelineExecutableInfoKHR ei = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, NULL, p, i}; uint32_t ns = 0;
+        if (gs(V.dev, &ei, &ns, NULL) || !ns) continue;
+        VkPipelineExecutableStatisticKHR st[32]; if (ns > 32) ns = 32;
+        for (uint32_t j = 0; j < ns; j++) st[j] = (VkPipelineExecutableStatisticKHR){VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
+        gs(V.dev, &ei, &ns, st);
+        char line[2048]; int o = snprintf(line, sizeof line, "[pipestats] %016llx %016llx %016llx %s:", (unsigned long long)key[0], (unsigned long long)key[1], (unsigned long long)key[2], ep[i].name);
+        for (uint32_t j = 0; j < ns && o < (int)sizeof line - 64; j++) {
+            o += snprintf(line + o, sizeof line - o, " %s=", st[j].name);
+            switch (st[j].format) {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: o += snprintf(line + o, sizeof line - o, "%u", st[j].value.b32); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: o += snprintf(line + o, sizeof line - o, "%lld", (long long)st[j].value.i64); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: o += snprintf(line + o, sizeof line - o, "%llu", (unsigned long long)st[j].value.u64); break;
+            default: o += snprintf(line + o, sizeof line - o, "%g", st[j].value.f64); break;
+            }
+        }
+        LOG("%s", line);
+        // DM_VK_PIPE_IR=<key>,<key>...: the driver's internal representations (its disassembly) of the pipelines with one of those shader keys, to files/pipe_ir/
+        const char *want = getenv("DM_VK_PIPE_IR"); const char *root = getenv("DM_ROOT"); char ks[3][20]; int hit = 0;
+        for (int s = 0; s < 3; s++) { snprintf(ks[s], sizeof ks[s], "%016llx", (unsigned long long)key[s]); if (want && key[s] && strstr(want, ks[s])) hit = 1; }
+        static PFN_vkGetPipelineExecutableInternalRepresentationsKHR gr;
+        if (!gr) gr = (PFN_vkGetPipelineExecutableInternalRepresentationsKHR)vkGetDeviceProcAddr(V.dev, "vkGetPipelineExecutableInternalRepresentationsKHR");
+        uint32_t nr = 0;
+        if (hit && root && gr && !gr(V.dev, &ei, &nr, NULL) && nr) {
+            VkPipelineExecutableInternalRepresentationKHR ir[8]; if (nr > 8) nr = 8;
+            for (uint32_t j = 0; j < nr; j++) ir[j] = (VkPipelineExecutableInternalRepresentationKHR){VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR};
+            gr(V.dev, &ei, &nr, ir);
+            for (uint32_t j = 0; j < nr; j++) { ir[j].pData = calloc(1, ir[j].dataSize + 1); }
+            gr(V.dev, &ei, &nr, ir);
+            char dir[700], path[800]; snprintf(dir, sizeof dir, "%s/pipe_ir", root); mkdir(dir, 0777);
+            for (uint32_t j = 0; j < nr; j++) {
+                snprintf(path, sizeof path, "%s/%s_%s_%s_%u_%u.txt", dir, ks[0], ks[1], ks[2], i, j);
+                FILE *f = fopen(path, "wb"); if (f) { fprintf(f, "# %s / %s: %s\n", ep[i].name, ir[j].name, ir[j].description); fwrite(ir[j].pData, 1, ir[j].isText ? strlen(ir[j].pData) : ir[j].dataSize, f); fclose(f); }
+                free(ir[j].pData);
+            }
+            LOG("[pipestats] %s %s %s %s: %u internal representations written to pipe_ir/", ks[0], ks[1], ks[2], ep[i].name, nr);
+        } else if (hit) LOG("[pipestats] %s %s %s %s: no internal representation from the driver", ks[0], ks[1], ks[2], ep[i].name);
+    }
 }
 
 // ---------------- descriptors ----------------
