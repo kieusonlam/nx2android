@@ -151,11 +151,6 @@ static class SwshXlate
         // Job softfloat64 = true: the host has no FP64, so Ryujinx's DoubleToFloat pass lowers double operations to float (Metal has no double type). Set only on the retry of a
         // shader whose first translation declared a 64-bit float (see Main): answering "no" for every shader would also drop the Float64 capability from all the others
         public bool QueryHostSupportsShaderFloat64() => !(_job["softfloat64"] is JsonNode n && (bool)n);
-        // Job "subgroup" (the Android chain: 128): the host's subgroup size. Maxwell code counts on 32-lane warps; above 32 the translator takes the lane id modulo 32,
-        // the ballot word of the lane's own 32 lanes and shuffles within them. With 32 assumed on Adreno (64 lanes), Monster Hunter Rise's normal accumulation (compute
-        // 48dd217e86f3d34b) added the sum of lanes 0-31 from lane 0 alone and lost lanes 32-63: 55 of the face's 1,205 vertices kept a zero normal (black patches on the faces).
-        // 128 also serves 64- and 32-lane devices (the lane's 32-lane group is lane >> 5)
-        public int QueryHostSubgroupSize() => _job["subgroup"] is JsonNode n ? (int)n : 32;
     }
 
     // True when the SPIR-V declares a 64-bit float type (OpTypeFloat 64): SPIRV-Cross then writes double, which the Metal compiler rejects
