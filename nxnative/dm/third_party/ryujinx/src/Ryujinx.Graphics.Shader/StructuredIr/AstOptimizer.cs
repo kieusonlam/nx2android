@@ -27,17 +27,14 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
 
                         // nxnative: a call's arguments stay the locals StructuredProgram copied them to (SPIR-V passes them by pointer). Propagated, the call
                         // kept a local whose declaration was removed (KeyNotFoundException in CodeGen/Spirv GetLocalPointer: 1,894 shaders of Viractal)
-                        // nxnative: an atomic, call or image atomic is not moved to its use nor removed with an unused result: the AST of an atomic whose result
-                        // goes to RZ (RED, ATOMS with no destination) is an assignment to a local nobody reads, and removing it dropped the memory write
-                        // (Monster Hunter Rise's character normals, accumulated with RED.E.ADD and ATOMS.ADD: all zero, the faces and bodies came out black)
-                        bool sideEffects = HasSideEffects(assignment.Source);
-
-                        if (propVar.Defs.Count == 1 && isWorthPropagating && !UsedByCall(propVar) && !sideEffects)
+                        if (propVar.Defs.Count == 1 && isWorthPropagating && !UsedByCall(propVar))
                         {
                             PropagateExpression(propVar, assignment.Source);
                         }
 
-                        if (propVar.Type == OperandType.LocalVariable && propVar.Uses.Count == 0 && !sideEffects)
+                        // nxnative: not when the source has side effects. An atomic whose result is never read went with its assignment: Tears of the Kingdom's
+                        // visibility counter (vertex shader 1eee2726aae7493e, an atomic add of a ballot's count) lost the add and everything that fed it
+                        if (propVar.Type == OperandType.LocalVariable && propVar.Uses.Count == 0 && !HasSideEffects(assignment.Source))
                         {
                             visitor.Block.Remove(assignment);
 
@@ -52,14 +49,13 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
 
         private static bool HasSideEffects(IAstNode source)
         {
-            if (source is not AstOperation op)
+            return source is AstOperation operation && (operation.Inst & Instruction.Mask) switch
             {
-                return false;
-            }
-
-            Instruction inst = op.Inst & Instruction.Mask;
-
-            return op.Inst.IsAtomic() || inst == Instruction.Call || inst == Instruction.ImageAtomic;
+                Instruction.AtomicAdd or Instruction.AtomicAnd or Instruction.AtomicCompareAndSwap or Instruction.AtomicMaxS32 or Instruction.AtomicMaxU32 or
+                Instruction.AtomicMinS32 or Instruction.AtomicMinU32 or Instruction.AtomicOr or Instruction.AtomicSwap or Instruction.AtomicXor or
+                Instruction.Call or Instruction.ImageAtomic => true,
+                _ => false,
+            };
         }
 
         private static bool UsedByCall(AstOperand propVar)

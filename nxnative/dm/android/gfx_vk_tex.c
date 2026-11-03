@@ -191,6 +191,10 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if ((d->flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
+    // a block-compressed texture can be drawn into through a view in the uncompressed format of its block size (Mario Kart 8 Deluxe writes BC3 blocks into its
+    // reflection cubemaps through RGBA32UI views): with EXTENDED_USAGE the image may carry a usage its own format lacks, and an attachment view needs it on the image
+    if (f->compressed && !f->dec && (f->bpb == 16 || f->bpb == 8)) { VkFormatProperties up; vkGetPhysicalDeviceFormatProperties(V.pd, f->bpb == 16 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32_UINT, &up);
+        if (up.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; }
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL,
         // a square 2D array of 6n layers too: shaders read one as a cube (Pokémon Legends: Arceus's reflection probes; the view was refused by the validation layer without the flag)
         VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | (d->target == 8 || d->target == 9 || (d->target == 4 && im->layers >= 6 && im->layers % 6 == 0 && im->w == im->h && im->samples <= 1) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
@@ -205,6 +209,9 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     }
     im->usage = ci.usage; im->cflags = ci.flags;
     VkResult r = vkCreateImage(V.dev, &ci, NULL, &im->img);
+    if (r && f->compressed && (ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {   // the driver refused the attachment usage on a compressed image: as before, without it
+        VKRED_ONCE(96, "compressed image format %#x refused colour-attachment usage (%d): created without it", d->format, r);
+        ci.usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; im->usage = ci.usage; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
     if (r) { VKRED_ONCE(10, "vkCreateImage failed (%d): %ux%ux%u format %#x (vk %d) target %d levels %u layers %u samples %u", r, im->w, im->h, im->d, d->format, f->vk, d->target, im->levels, im->layers, im->samples); free(im); return NULL; }
     VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, im->img, &req);
     if ((ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) && im->w >= 256) { static int n; if (n++ < 16)   // UBWC check: a compressed target takes room for its metadata
@@ -358,8 +365,11 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     im->used = g_tex_frame;
     pthread_mutex_unlock(&g_img_mu);
     if (!vk_sub_open()) return fresh ? NULL : im;   // looked up outside a submission (present): nothing can be recorded, a new image has no contents yet
+    // a texture's first use: written by the CPU since it was registered (profile tex_dirty_upload), it is CPU-written from now on, as at nvn_mtl.m's first resolution;
+    // otherwise only a later nvn_ft_poll pass finds it, and its first draws read zeros
+    int nvn_ft_written(const tex_t *);
     if (t->mem && lin_copy(im, t, f)) {}
-    else if (t->mem && packaged_tex(t)) {
+    else if (t->mem && (packaged_tex(t) || (fresh && nvn_ft_written(t)))) {
         im->pkg_used = g_tex_frame;
         if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
         else {
