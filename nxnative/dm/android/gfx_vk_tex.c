@@ -331,7 +331,7 @@ extern uint64_t g_tex_frame;   // presents so far, for the packaged textures' la
 // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
 enum { EVICT_KEEP = 60 };
 static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
-static void img_drop(vkimg_t *im) { vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+static void img_drop(vkimg_t *im) { vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sh_img) { if (im->sh_sub) vk_defer_free_image_sub(im->sh_img, im->sh_sub); else vk_defer_free_image(im->sh_img, im->sh_mem); } if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     akey ks[64]; int n = 0;
     for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {
@@ -558,6 +558,26 @@ static VkComponentMapping sample_swizzle(const VkComponentMapping *format, const
         apply(swz_comp(sw[3]),format,VK_COMPONENT_SWIZZLE_A)};
 }
 __thread VkFormat vk_view_fmt; __thread uint32_t vk_view_layers;
+static int shadow3d_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_3D_SHADOW"); on = e && atoi(e); } return on; }
+// the 2D array image a 3D colour image is drawn through (vkimg sh_img): its slices as layers, every level at full depth, the same format list, usage and mutability
+static void shadow3d_make(vkimg_t *im) {
+    VkFormat fl[2] = {im->fmt, im->fmt2}; VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, im->fmt2 ? 2u : 1u, fl};
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, im->fixed_fmt ? &fli : NULL, im->cflags & ~(VkImageCreateFlags)(VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT),
+        VK_IMAGE_TYPE_2D, im->fmt, {im->w, im->h, 1}, im->levels, im->d, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, im->usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage img; if (vkCreateImage(V.dev, &ci, NULL, &img)) { VKRED_ONCE(120, "3D shadow image %ux%ux%u format %d refused: drawn into directly", im->w, im->h, im->d, im->fmt); return; }
+    VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, img, &req); VkDeviceSize moff; void *sub;
+    VkDeviceMemory m = vk_image_memory(&req, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT), &moff, &sub);
+    if (!m) { vkDestroyImage(V.dev, img, NULL); VKRED_ONCE(121, "3D shadow image memory refused: drawn into directly"); return; }
+    VKCHK(vkBindImageMemory(V.dev, img, m, moff));
+    im->sh_mem = m; im->sh_sub = sub; im->sh_usage = ci.usage; im->sh_cflags = ci.flags; im->sh_ready = 0; im->sh_img = img;
+    { static int n; if (n++ < 8) VKLOG("3D image %ux%ux%u format %d drawn into: through a 2D array shadow of %u layers (DM_VK_3D_SHADOW)", im->w, im->h, im->d, im->fmt, im->d); }
+}
+int vk_shadow_view(vkimg_t *im, VkImageView v, uint32_t *lv, uint32_t *ly0, uint32_t *nly) {
+    if (!im || !im->sh_img) return 0;
+    pthread_mutex_lock(&g_view_mu);
+    for (vview *x = nvn_hm_get(&g_views, &im); x; x = x->next) if (x->v == v && x->attach) { *lv = x->lv0; *ly0 = x->ly0; *nly = x->nly; pthread_mutex_unlock(&g_view_mu); return 1; }
+    pthread_mutex_unlock(&g_view_mu); return 0;
+}
 VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, int as_attachment, vkimg_t **img_out) {
     vkimg_t *im = vk_tex(t); if (img_out) *img_out = im;
     if (!im) return VK_NULL_HANDLE;
@@ -596,6 +616,7 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
     const vkfmt_t *imf = vk_fmt(im->nvn_format);   // (a BC format decoded on the CPU counts as compressed: its view keeps the decoded image's format)
     if ((im->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || (f->compressed || f->dec) != (imf->compressed || imf->dec) || (f->dec && f->dbpp != imf->dbpp)) fmt = im->fmt;   // depth views and block-size changes keep the image's format
     if (im->fixed_fmt && fmt != im->fmt && fmt != srgb_twin(im->fmt)) { fmt = im->fmt; static int n; if (n++ < 8) VKLOG("[RED] view format %d of a format-listed image (%d, DM_VK_UBWC): the image's own used", f->vk, im->fmt); }
+    if (as_attachment && im->vtype == VK_IMAGE_VIEW_TYPE_3D && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && im->samples <= 1 && !im->sh_img && shadow3d_on()) shadow3d_make(im);
     pthread_mutex_lock(&g_view_mu);
     vview *head = nvn_hm_get(&g_views, &im);
     for (vview *v = head; v; v = v->next)
@@ -605,7 +626,7 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
     uci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (as_attachment) uci.usage = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) | (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
     else if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) uci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-    VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, 0, im->img, type, fmt, swz, {aspect, lv0, nlv, ly0, nly}};
+    VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, 0, as_attachment && im->sh_img ? im->sh_img : im->img, type, fmt, swz, {aspect, lv0, nlv, ly0, nly}};
     VkImageView view; VkResult r = vkCreateImageView(V.dev, &ci, NULL, &view);
     if (r) { pthread_mutex_unlock(&g_view_mu); VKRED_ONCE(15, "vkCreateImageView failed (%d): type %d format %d levels %u+%u layers %u+%u of image %ux%ux%u", r, type, fmt, lv0, nlv, ly0, nly, im->w, im->h, im->layers); return VK_NULL_HANDLE; }
     vview *nv = calloc(1, sizeof *nv); *nv = (vview){view, type, fmt, lv0, nlv, ly0, nly, swz, aspect, as_attachment != 0, head};

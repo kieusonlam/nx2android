@@ -84,6 +84,7 @@ void vk_defer_free_image(VkImage i, VkDeviceMemory m);
 VkDeviceMemory vk_image_memory(const VkMemoryRequirements *req, uint32_t type, VkDeviceSize *off, void **sub);   // NULL on failure; *sub: a slot of a shared block, or NULL (memory of its own)
 void vk_defer_free_image_sub(VkImage i, void *sub);
 void vk_defer_free_view(VkImageView v);
+void vk_defer_free_fb(VkFramebuffer f);   // a framebuffer made for one pass (gfx_vk_exec.c layered passes)
 void vk_defer_free_bview(VkBufferView v);   // a texel buffer view, destroyed when this submission completes
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l);    // from this submission's descriptor pools
 uint64_t vk_fence_done(void);   // the highest submission fence the GPU has completed
@@ -122,7 +123,11 @@ struct vkimg {
     uint64_t pool; int64_t off, size; int flags;   // its storage (pool, offset, layout size) and NVN texture flags: images over the same memory find each other
     struct vkimg *ovl[8]; int novl;   // the other images over some of the same memory (a texture of another description over it: on the Switch it sees these texels)
     uint64_t wseq, rseen;             // when it was last rendered to (gfx_vk_tex.c g_wseq); the newest overlapping write already reported
+    // DM_VK_3D_SHADOW=1: a 3D colour image drawn into is drawn into a 2D array image of its slices instead, copied into it at the pass end (gfx_vk_exec.c). The RP5's
+    // Qualcomm driver (Adreno 650) crashed in vkCmdBeginRenderPass on a 2D array view of a 3D image (Minecraft Dungeons II's 32x32x32 colour grading LUT, all 32 slices in one pass)
+    VkImage sh_img; VkDeviceMemory sh_mem; void *sh_sub; VkImageUsageFlags sh_usage; VkImageCreateFlags sh_cflags; int sh_ready;
 };
+int vk_shadow_view(vkimg_t *im, VkImageView v, uint32_t *lv, uint32_t *ly0, uint32_t *nly);   // v is an attachment view of im's shadow: its level and slices (gfx_vk_tex.c)
 vkimg_t *vk_tex(const tex_t *t);                                 // the image of a texture object (created, uploaded or refreshed as needed)
 void vk_lrz_forget(vkimg_t *im);                                 // an image is being dropped: the pass code forgets it (gfx_vk_exec.c)
 int vk_window_bottom_up(void);                                   // the game draws in lower-left origin mode: its window image is stored bottom-up (gfx_vk_exec.c)

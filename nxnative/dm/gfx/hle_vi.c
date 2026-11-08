@@ -54,8 +54,21 @@ uint64_t dm_nvn_frame_count(void);
 HLE_FORCE("_ZN2nn2vi20GetLatestFrameNumberEPmPKNS0_5LayerE", "the layer's latest frame number: the frames presented so far", Result, h_vi_FrameNo, uint64_t *out, const void *layer) {
     (void)layer; *out = dm_nvn_frame_count(); return RES_OK;
 }
-HLE_FORCE("_ZN2nn2vi16ListFrameHistoryEPNS0_9FrameInfoEiPKNS0_5LayerE", "the layer's frame history: none kept, 0 entries", int, h_vi_FrameHist, void *out, int n, const void *layer) {
-    (void)out; (void)layer; static int once; if (!once++) LOG("vi::ListFrameHistory (%d entries asked): the host keeps no frame history, 0 returned", n);
+// DM_VI_FRAME_HISTORY=1 (RP5 local): one entry, the latest presented frame. Minecraft Dungeons II's flip thread (main+0x142afb0) waits on the vsync event, asks the count
+//   (n 0), lists, takes the first entry whose u64 at +0 is 2 and a new frame number at +8, with two tick times at +0x18/+0x20; that completes Unreal's swapchain fences
+//   (FFrameEndSync, r.GTSyncType 2). With 0 entries the game thread waits for ever after the intro movies (black screen). FrameInfo is 0x28 bytes
+static int frame_hist_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VI_FRAME_HISTORY"); on = e && atoi(e); } return on; }
+HLE_FORCE("_ZN2nn2vi16ListFrameHistoryEPNS0_9FrameInfoEiPKNS0_5LayerE", "the layer's frame history: none kept (0 entries), or the latest presented frame (DM_VI_FRAME_HISTORY=1)", int, h_vi_FrameHist, void *out, int n, const void *layer) {
+    (void)layer;
+    if (frame_hist_on()) {
+        uint64_t f = dm_nvn_frame_count();
+        if (!f) return 0;
+        if (!out || n <= 0) return 1;
+        uint64_t t = guest_ns() * 12 / 625, *e = out;
+        e[0] = 2; e[1] = f; e[2] = 0; e[3] = t; e[4] = t;
+        return 1;
+    }
+    static int once; if (!once++) LOG("vi::ListFrameHistory (%d entries asked): the host keeps no frame history, 0 returned", n);
     return 0;
 }
 // Rhythm Heaven Groove (SDK 21) asks for the built-in panel's identity at start (main+0xa9a4); the SDK's version calls through the vi service object the host never made (SIGSEGV at +0x20).

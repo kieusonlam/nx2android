@@ -317,6 +317,37 @@ static void lrz_touch(vkimg_t *im, int write) {
 // read above), or writing it back, did not help; writing back every depth buffer before every pass that loads one did (0 broken frames of 53 against 17 of 46,
 // GPU +1 ms), as did writing back only the one a pass switches away from (0 genuine drops in about 140 frames, GPU +0.6-0.8 ms of 13-18)
 static vkimg_t *g_lrz_prev;
+// DM_VK_3D_SHADOW (vkimg sh_img): the colour attachments of this pass drawn through a 3D image's 2D array shadow; loaded ones get the slices first, and the pass end copies them back
+static struct { vkimg_t *im; uint32_t lv, ly0, nly; } g_sh3d[8]; static uint32_t g_sh3d_mask;
+static int sh3d_is(uint32_t i) { return i < 8 && (g_sh3d_mask >> i & 1); }
+static VkImageCopy sh3d_region(int i, int to3d) {
+    uint32_t lv = g_sh3d[i].lv, w = g_sh3d[i].im->w >> lv, h = g_sh3d[i].im->h >> lv;
+    VkImageSubresourceLayers a = {VK_IMAGE_ASPECT_COLOR_BIT, lv, g_sh3d[i].ly0, g_sh3d[i].nly}, b = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1};
+    VkOffset3D o0 = {0, 0, 0}, oz = {0, 0, (int32_t)g_sh3d[i].ly0};
+    VkExtent3D ex = {w ? w : 1, h ? h : 1, g_sh3d[i].nly};
+    return to3d ? (VkImageCopy){a, o0, b, oz, ex} : (VkImageCopy){b, oz, a, o0, ex};
+}
+static void shadow3d_begin(void) {
+    g_sh3d_mask = 0;
+    for (uint32_t i = 0; i < P_ri.colorAttachmentCount && i < 8; i++) {
+        vkimg_t *im = P_ca[i].imageView ? P_att[i].im : NULL; uint32_t lv, ly0, nly;
+        if (!im || !im->sh_img || !vk_shadow_view(im, P_ca[i].imageView, &lv, &ly0, &nly)) continue;
+        g_sh3d[i].im = im; g_sh3d[i].lv = lv; g_sh3d[i].ly0 = ly0; g_sh3d[i].nly = nly; g_sh3d_mask |= 1u << i;
+        VkCommandBuffer cb = vk_cmd();
+        if (!im->sh_ready) { VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im->sh_img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b); im->sh_ready = 1; }
+        if (P_ca[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) { if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
+            VkImageCopy c = sh3d_region((int)i, 0); vk_img_barrier_all(cb); vkCmdCopyImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, im->sh_img, VK_IMAGE_LAYOUT_GENERAL, 1, &c); vk_img_barrier_all(cb); }
+    }
+}
+static void shadow3d_end(void) {
+    if (!g_sh3d_mask) return;
+    VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
+    for (int i = 0; i < 8; i++) if (g_sh3d_mask >> i & 1) { vkimg_t *im = g_sh3d[i].im; if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
+        VkImageCopy c = sh3d_region(i, 1); vkCmdCopyImage(cb, im->sh_img, VK_IMAGE_LAYOUT_GENERAL, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c); }
+    vk_img_barrier_all(cb); g_sh3d_mask = 0;
+}
 void vk_lrz_forget(vkimg_t *im) { if (g_lrz_prev == im) g_lrz_prev = NULL; }   // an image dropped (gfx_vk_tex.c img_drop)
 // 0: no pass could be begun (no render pass or framebuffer, and no dynamic rendering to fall back on): the caller records nothing that needs one
 static int pass_commit(void) {
@@ -325,13 +356,14 @@ static int pass_commit(void) {
     if ((g_lrz_touch & LRZ_SWITCH) && dim && g_lrz_prev && g_lrz_prev != dim) lrz_touch(g_lrz_prev, 1);
     if (dim) g_lrz_prev = dim;
     if ((g_lrz_touch & LRZ_READ) && dim && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) lrz_touch(dim, 0);
+    shadow3d_begin();
     void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(0, 0, 0, 0, 0);
     if (rp_on()) {
         rpkey k; memset(&k, 0, sizeof k); k.ncol = P_ri.colorAttachmentCount; k.samples = S.samples ? S.samples : 1;
         fbkey fk; memset(&fk, 0, sizeof fk); VkImageView views[9]; VkClearValue cv[9]; uint32_t na = 0;
         for (uint32_t i = 0; i < k.ncol; i++) if (P_ca[i].imageView) {
             k.cfmt[i] = P_att[i].fmt; k.cload[i] = P_ca[i].loadOp; cv[na] = P_ca[i].clearValue; views[na] = P_ca[i].imageView;
-            fk.a[na].usage = P_att[i].im->usage; fk.a[na].flags = P_att[i].im->cflags; fk.a[na].w = P_att[i].w; fk.a[na].h = P_att[i].h; fk.a[na].layers = P_att[i].layers;
+            fk.a[na].usage = P_att[i].im->usage; fk.a[na].flags = sh3d_is(i) ? P_att[i].im->sh_cflags : P_att[i].im->cflags; fk.a[na].w = P_att[i].w; fk.a[na].h = P_att[i].h; fk.a[na].layers = P_att[i].layers;
             fk.a[na].fmt = P_att[i].im->fmt2 ? (uint32_t)P_att[i].im->fmt : P_att[i].fmt; fk.a[na].fmt2 = (uint32_t)P_att[i].im->fmt2; na++; }   // (a format-listed image (DM_VK_UBWC): its whole list, as imageless framebuffers require)
         if (P_ri.pDepthAttachment || P_ri.pStencilAttachment) {
             k.dfmt = P_att[8].fmt; k.dload = P_da.loadOp; k.sload = P_sa.imageView ? P_sa.loadOp : VK_ATTACHMENT_LOAD_OP_DONT_CARE; k.dstore = P_da.storeOp;
@@ -340,9 +372,17 @@ static int pass_commit(void) {
             fk.a[na].usage = P_att[8].im->usage; fk.a[na].flags = P_att[8].im->cflags; fk.a[na].w = P_att[8].w; fk.a[na].h = P_att[8].h; fk.a[na].layers = P_att[8].layers; fk.a[na].fmt = P_att[8].fmt; na++; }
         VkRenderPass rp = rp_get(&k);
         fk.rp = rp_compat(k.ncol, k.cfmt, k.dfmt, k.samples); fk.w = P_ri.renderArea.extent.width; fk.h = P_ri.renderArea.extent.height; fk.layers = P_ri.layerCount; fk.n = na;
-        VkFramebuffer fb = rp && fk.rp ? fb_get(&fk) : VK_NULL_HANDLE;
+        // a layered pass (DM_VK_LAYERED_FB=1): a framebuffer with its views, made for this pass. The RP5's Qualcomm driver (Adreno 650) crashed in vkCmdBeginRenderPass on an
+        // imageless framebuffer of 32 layers (Minecraft Dungeons II's 32x32x32 colour grading LUT, drawn in one pass); single-layer passes keep the cached imageless ones
+        static int lfb = -1; if (lfb < 0) { const char *e = getenv("DM_VK_LAYERED_FB"); lfb = e && atoi(e); }
+        int own_fb = lfb && fk.layers > 1 && rp;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        if (own_fb) { VkFramebufferCreateInfo ci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, rp, na, views, fk.w, fk.h, fk.layers};
+            if (vkCreateFramebuffer(V.dev, &ci, NULL, &fb)) { VKRED_ONCE(122, "layered framebuffer (%u layers) refused", fk.layers); fb = VK_NULL_HANDLE; }
+            else { vk_defer_free_fb(fb); static int n; if (n++ < 4) VKLOG("layered pass (%u layers, %ux%u): a framebuffer with its views (DM_VK_LAYERED_FB)", fk.layers, fk.w, fk.h); } }
+        else fb = rp && fk.rp ? fb_get(&fk) : VK_NULL_HANDLE;
         if (fb) { VkRenderPassAttachmentBeginInfo abi = {VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO, NULL, na, views};
-            VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, &abi, rp, fb, P_ri.renderArea, na, cv};
+            VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, own_fb ? NULL : &abi, rp, fb, P_ri.renderArea, na, cv};
             vkCmdBeginRenderPass(vk_cmd(), &rbi, VK_SUBPASS_CONTENTS_INLINE); S.rp_pass = 1; }
         else if (V.has_dynrender) { vkCmdBeginRendering(vk_cmd(), &P_ri); S.rp_pass = 0; }
         else { VKRED_ONCE(76, "render pass or framebuffer failed without dynamic rendering: pass skipped"); return 0; }   // (still pass_open 2: vk_end_pass drops it)
@@ -583,6 +623,7 @@ void vk_end_pass(void) {
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); list_reads("it"); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
     if (S.pass_open == 1) { if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
+    if (S.pass_open == 1) shadow3d_end();
     if (S.pass_open == 1 && g_lin_back && g_pass_draws) lin_back();
     if (S.pass_open == 1) crumb_mark(0);
     if (S.pass_open == 1) end_mark();
