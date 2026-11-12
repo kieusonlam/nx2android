@@ -6,7 +6,7 @@ Left out because they have an official Android release: Unpacking (ported here a
 
 "Profile here": `nxnative/dm/games/<title ID>/` has the game's profile from nxnative. "Upstream profile": only seedds/nxnative has one, to read as a reference or starter, not to pull. "60 fps with X" is upstream's note: they run that update at 60 fps (30 on the Switch).
 
-**38 / 102 ported**
+**43 / 102 ported**
 
 - [x] 13 Sentinels: Aegis Rim · `01003FC01670C000`
 - [ ] Ace Attorney Investigations Collection · `010005501E68C000` · profile here
@@ -32,6 +32,7 @@ Left out because they have an official Android release: Unpacking (ported here a
 - [ ] Cuphead · `0100A5C00D162000` · profile here
 - [x] DARK SOULS: REMASTERED · `01004AB00A260000`
 - [ ] Digimon Story Cyber Sleuth: Complete Edition · `010014E00DB56000` · profile here
+- [x] Disco Elysium - The Final Cut · `01006C5015E84000`
 - [x] Donkey Kong Country Returns HD · `01009D901BC56000`
 - [ ] Donkey Kong Country: Tropical Freeze · `0100C1F0051B6000` · upstream profile
 - [ ] DRAGON QUEST VII Reimagined · `0100A9D01C446000` · profile here
@@ -48,7 +49,7 @@ Left out because they have an official Android release: Unpacking (ported here a
 - [x] Hades II · `0100A00019DE0000`
 - [x] Hollow Knight: Silksong · `010013C00E930000`
 - [ ] Hyrule Warriors: Age of Calamity · `01002B00111A2000` · profile here · 60 fps with 1.3.0
-- [ ] Kirby and the Forgotten Land · `01004D300C5AE000` · upstream profile
+- [x] Kirby and the Forgotten Land · `01004D300C5AE000`
 - [x] Lonely Mountains: Downhill · `0100A0C00E0DE000` · Retroid Pocket 6 / PurpleVK; brief visual glitches
 - [ ] Luigi's Mansion 3 · `0100DCA0064A6000` · profile here · 60 fps with 1.4.0
 - [ ] Mario + Rabbids Kingdom Battle · `010067300059A000` · upstream profile
@@ -60,8 +61,8 @@ Left out because they have an official Android release: Unpacking (ported here a
 - [ ] Monster Train 2 · `010051701FB46000` · profile here · 60 fps with 1.1.1 · only the first Monster Train is on mobile
 - [x] NEO: The World Ends with You · `010043B013C5C000`
 - [ ] NieR:Automata The End of YoRHa Edition · `010056B015FE8000` · upstream profile · 60 fps with 1.0.3
-- [ ] OCTOPATH TRAVELER · `010057D006492000` · upstream profile
-- [ ] Octopath Traveler 0 · `01005270232F2000` · profile here · 60 fps with 1.0.5
+- [ ] OCTOPATH TRAVELER · `010057D006492000` · profile here
+- [x] Octopath Traveler 0 · `01005270232F2000`
 - [ ] Octopath Traveler II · `0100A3501946E000` · upstream profile · 60 fps with 1.1.1
 - [x] Paper Mario: The Origami King · `0100A3900C3E2000`
 - [x] Paper Mario: The Thousand-Year Door · `0100ECD018EBE000`
@@ -73,7 +74,7 @@ Left out because they have an official Android release: Unpacking (ported here a
 - [ ] Pokémon Brilliant Diamond · `0100000011D90000` · upstream profile · 60 fps with 1.3.0
 - [x] Pokémon Legends: Arceus · `01001F5010DFA000`
 - [x] Pokémon Legends: Z-A · `0100F43008C44000`
-- [ ] Pokémon Scarlet · `0100A3D008C5C000` · upstream profile
+- [x] Pokémon Scarlet · `0100A3D008C5C000`
 - [ ] Pokémon Shield · `01008DB008C2C000` · upstream profile
 - [ ] Pokémon Sword · `0100ABF008968000` · upstream profile
 - [ ] Portal · `01007BB017812000` · upstream profile · Android only on NVIDIA Shield TV
@@ -85,7 +86,7 @@ Left out because they have an official Android release: Unpacking (ported here a
 - [x] South Park™: The Stick Of Truth™ · `010043600B6A6000` · needs a Vulkan 1.3 driver or imageless framebuffers with render pass 2 (Turnip packed on the Adreno 640)
 - [ ] SteamWorld Heist II · `010089C01E9CA000` · upstream profile
 - [ ] STEINS;GATE RE:BOOT · `01008BC024FDE000` · profile here
-- [ ] Super Mario 3D World + Bowser's Fury · `010028600EBDA000` · profile here
+- [x] Super Mario 3D World + Bowser's Fury · `010028600EBDA000`
 - [x] Super Mario Bros. Wonder · `010015100B514000`
 - [ ] Super Mario Galaxy · `010099C022B96000` · profile here
 - [ ] Super Mario Galaxy 2 · `0100FD8022DAA000` · profile here
